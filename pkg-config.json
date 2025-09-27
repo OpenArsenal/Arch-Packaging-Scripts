@@ -1,0 +1,77 @@
+{
+  "packages": {
+    "1password-cli-bin": {
+      "feed_type": "1password",
+      "feed_url": "https://releases.1password.com/linux/index.xml",
+      "filter_prereleases": true,
+      "description": "1Password CLI tool",
+      "update_frequency": "weekly"
+    },
+    "github-cli": {
+      "feed_type": "github",
+      "feed_url": "https://github.com/cli/cli/releases.atom",
+      "filter_prereleases": true,
+      "description": "GitHub CLI tool"
+    },
+    "google-chrome-bin": {
+      "feed_type": "chrome",
+      "feed_url": "https://feeds.feedburner.com/GoogleChromeReleases",
+      "filter_prereleases": true,
+      "description": "Google Chrome stable"
+    },
+    "google-chrome-canary-bin": {
+      "feed_type": "chrome",
+      "feed_url": "https://feeds.feedburner.com/GoogleChromeReleases",
+      "filter_prereleases": false,
+      "description": "Google Chrome canary"
+    },
+    "microsoft-edge-stable-bin": {
+      "feed_type": "edge",
+      "feed_url": "https://packages.microsoft.com/yumrepos/edge/repodata/repomd.xml",
+      "filter_prereleases": true,
+      "description": "Microsoft Edge stable"
+    },
+    "visual-studio-code-bin": {
+      "feed_type": "github",
+      "feed_url": "https://github.com/microsoft/vscode/releases.atom",
+      "filter_prereleases": true,
+      "description": "VS Code binary"
+    },
+    "vesktop": {
+      "feed_type": "github",
+      "feed_url": "https://github.com/Vencord/Vesktop/releases.atom",
+      "filter_prereleases": true,
+      "description": "Vesktop Discord client"
+    },
+    "vesktop-git": {
+      "feed_type": "github",
+      "feed_url": "https://github.com/Vencord/Vesktop/tags.atom",
+      "filter_prereleases": false,
+      "description": "Vesktop git version"
+    },
+    "ktailctl": {
+      "feed_type": "github",
+      "feed_url": "https://github.com/f-koehler/KTailctl/releases.atom",
+      "filter_prereleases": true,
+      "description": "KDE Tailscale GUI"
+    },
+    "kurtosis-cli-bin": {
+      "feed_type": "github",
+      "feed_url": "https://github.com/kurtosis-tech/kurtosis/releases.atom",
+      "filter_prereleases": true,
+      "description": "Kurtosis CLI"
+    }
+  },
+  "global_settings": {
+    "max_concurrent_updates": 3,
+    "timeout_seconds": 30,
+    "backup_pkgbuilds": true,
+    "log_level": "info",
+    "user_agent": "Package-Update-Bot/1.0"
+  },
+  "notification_settings": {
+    "slack_webhook": "",
+    "email_notifications": false,
+    "desktop_notifications": true
+  }
+}
