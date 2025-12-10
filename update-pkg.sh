@@ -104,6 +104,8 @@ declare -A FEED_TYPE=(
     ["vesktop-git"]="github"
     ["ktailctl"]="github"
     ["kurtosis-cli-bin"]="github"
+    ["talosctl-bin"]="github"
+    ["omnictl-bin"]="github"
 )
 
 declare -A FEED_URL=(
@@ -117,6 +119,8 @@ declare -A FEED_URL=(
     ["vesktop-git"]="https://github.com/Vencord/Vesktop/tags.atom"
     ["ktailctl"]="https://github.com/f-koehler/KTailctl/releases.atom"
     ["kurtosis-cli-bin"]="https://github.com/kurtosis-tech/kurtosis/releases.atom"
+    ["talosctl-bin"]="https://github.com/siderolabs/talos/releases.atom"
+    ["omnictl-bin"]="https://github.com/siderolabs/omni/releases.atom"
 )
 
 # Debug function to show array contents
