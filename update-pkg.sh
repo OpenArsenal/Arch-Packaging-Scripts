@@ -19,9 +19,9 @@ declare -r PACKAGE_UPDATE_BOT_USER_AGENT="Package-Update-Bot/1.0"
 declare -r FETCH_TIMEOUT=30
 
 # Logging functions
-log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
-log_warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; }
+log_info() { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*" >&2; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $*" >&2; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 # Copy version fetching functions from debug-feeds.sh
@@ -102,6 +102,8 @@ declare -A FEED_TYPE=(
     ["visual-studio-code-bin"]="vscode"
     ["vesktop"]="github"
     ["vesktop-git"]="github"
+    ["vesktop-electron"]="github"
+    ["vesktop-electron-git"]="github"
     ["ktailctl"]="github"
     ["kurtosis-cli-bin"]="github"
     ["talosctl-bin"]="github"
@@ -117,6 +119,8 @@ declare -A FEED_URL=(
     ["visual-studio-code-bin"]=""
     ["vesktop"]="https://github.com/Vencord/Vesktop/releases.atom"
     ["vesktop-git"]="https://github.com/Vencord/Vesktop/tags.atom"
+    ["vesktop-electron"]="https://github.com/Vencord/Vesktop/releases.atom"
+    ["vesktop-electron-git"]="https://github.com/Vencord/Vesktop/tags.atom"
     ["ktailctl"]="https://github.com/f-koehler/KTailctl/releases.atom"
     ["kurtosis-cli-bin"]="https://github.com/kurtosis-tech/kurtosis/releases.atom"
     ["talosctl-bin"]="https://github.com/siderolabs/talos/releases.atom"
@@ -195,6 +199,16 @@ get_current_pkgver() {
     fi
 }
 
+is_vcs_package() {
+  local pkg="$1"
+  local pkgbuild_path="$2"
+
+  [[ "$pkg" =~ -(git|hg|svn|bzr)$ ]] && return 0
+  grep -qE '^\s*pkgver\(\)' "$pkgbuild_path" && return 0
+  grep -qE 'git\+' "$pkgbuild_path" && return 0
+  return 1
+}
+
 # Update PKGBUILD with new version
 update_pkgbuild_version() {
     local pkgbuild_path="$1"
@@ -202,6 +216,9 @@ update_pkgbuild_version() {
 
     # Validate version format (no hyphens allowed in Arch pkgver)
     local clean_version="${new_version//-/_}"
+    clean_version="${clean_version//$'\r'/}"
+    clean_version="${clean_version%%$'\n'*}"
+    clean_version="${clean_version//&/\\&}"
 
     # Create backup
     cp "$pkgbuild_path" "${pkgbuild_path}.backup"
@@ -257,7 +274,8 @@ build_package() {
     # -f: overwrite existing package
     # --noconfirm: don't ask for user input
     # --needed: don't reinstall up-to-date dependencies
-    if makepkg -scf --noconfirm --needed 2>/dev/null; then
+    local log_file=".makepkg.log"
+    if makepkg -scf --noconfirm --needed 2>&1 | tee "$log_file"; then
         log_success "Successfully built $pkg_name"
 
         # List built packages
@@ -272,6 +290,8 @@ build_package() {
         return 0
     else
         log_error "Failed to build $pkg_name"
+        log_error "makepkg failed. Last 120 lines:"
+        tail -n 120 "$log_file" >&2
         return 1
     fi
 }
@@ -297,6 +317,13 @@ update_package() {
         return 1
     fi
 
+    if is_vcs_package "$pkg" "$pkgbuild_path"; then
+        log_info "$pkg looks like a VCS package; skipping PKGBUILD version bump and just building."
+        update_checksums "$pkg_dir" || true
+        build_package "$pkg_dir"
+        return $?
+    fi
+
     # Fetch latest version - wrap in error handling
     log_info "Fetching latest version for $pkg..."
     local latest_version
@@ -307,6 +334,11 @@ update_package() {
 
     if [[ -z "$latest_version" ]]; then
         log_error "Empty version returned for $pkg"
+        return 1
+    fi
+
+    if [[ "$latest_version" =~ [[:space:]] ]]; then
+        log_error "Latest version for $pkg contains whitespace/newlines. Got: '$latest_version'"
         return 1
     fi
 

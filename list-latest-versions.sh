@@ -85,29 +85,47 @@ get_edge_version() {
 
 # Package definitions
 declare -A FEED_TYPE=(
-  [1password-cli-bin]="1password"
-  [github-cli]="github"
-  [google-chrome-bin]="chrome-stable"
-  [google-chrome-canary-bin]="chrome-canary"
-  [microsoft-edge-stable-bin]="edge"
-  [visual-studio-code-bin]="vscode"
-  [vesktop]="github"
-  [vesktop-git]="github"
-  [ktailctl]="github"
-  [kurtosis-cli-bin]="github"
+  ["1password-cli-bin"]="1password"
+  ["github-cli"]="github"
+  ["google-chrome-bin"]="chrome-stable"
+  ["google-chrome-canary-bin"]="chrome-canary"
+  ["microsoft-edge-stable-bin"]="edge"
+  ["visual-studio-code-bin"]="vscode"
+  ["vesktop"]="github"
+  ["vesktop-git"]="github"
+  ["vesktop-electron"]="github"
+  ["vesktop-electron-git"]="github"
+  ["ktailctl"]="github"
+  ["kurtosis-cli-bin"]="github"
+  ["talosctl-bin"]="github"
+  ["omnictl-bin"]="github"
 )
 declare -A FEED_URL=(
-  [1password-cli-bin]="https://releases.1password.com/linux/index.xml"
-  [github-cli]="https://github.com/cli/cli/releases.atom"
-  [google-chrome-bin]=""  # JSON API
-  [google-chrome-canary-bin]=""  # JSON API
-  [microsoft-edge-stable-bin]="https://packages.microsoft.com/yumrepos/edge/repodata/repomd.xml"
-  [visual-studio-code-bin]=""  # GitHub API
-  [vesktop]="https://github.com/Vencord/Vesktop/releases.atom"
-  [vesktop-git]="https://github.com/Vencord/Vesktop/tags.atom"
-  [ktailctl]="https://github.com/f-koehler/KTailctl/releases.atom"
-  [kurtosis-cli-bin]="https://github.com/kurtosis-tech/kurtosis/releases.atom"
+  ["1password-cli-bin"]="https://releases.1password.com/linux/index.xml"
+  ["github-cli"]="https://github.com/cli/cli/releases.atom"
+  ["google-chrome-bin"]=""
+  ["google-chrome-canary-bin"]=""
+  ["microsoft-edge-stable-bin"]="https://packages.microsoft.com/yumrepos/edge/repodata/repomd.xml"
+  ["visual-studio-code-bin"]=""
+  ["vesktop"]="https://github.com/Vencord/Vesktop/releases.atom"
+  ["vesktop-git"]="https://github.com/Vencord/Vesktop/tags.atom"
+  ["vesktop-electron"]="https://github.com/Vencord/Vesktop/releases.atom"
+  ["vesktop-electron-git"]="https://github.com/Vencord/Vesktop/tags.atom"
+  ["ktailctl"]="https://github.com/f-koehler/KTailctl/releases.atom"
+  ["kurtosis-cli-bin"]="https://github.com/kurtosis-tech/kurtosis/releases.atom"
+  ["talosctl-bin"]="https://github.com/siderolabs/talos/releases.atom"
+  ["omnictl-bin"]="https://github.com/siderolabs/omni/releases.atom"
 )
+
+is_vcs_package() {
+  local pkg="$1"
+  local pkgbuild_path="$2"
+
+  [[ "$pkg" =~ -(git|hg|svn|bzr)$ ]] && return 0
+  grep -qE '^\s*pkgver\(\)' "$pkgbuild_path" && return 0
+  grep -qE 'git\+' "$pkgbuild_path" && return 0
+  return 1
+}
 
 # Main: fetch and print latest versions
 for pkg in "${!FEED_TYPE[@]}"; do
