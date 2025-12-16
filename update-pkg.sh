@@ -92,9 +92,24 @@ get_edge_version() {
     echo "$version"
 }
 
+get_1password_cli2_version_json() {
+  local url="$1"
+
+  local response
+  response=$(fetch "$url" 2>/dev/null)
+
+  if [[ -z "$response" ]] || ! echo "$response" | jq . >/dev/null 2>&1; then
+    log_error "Invalid JSON response from 1Password CLI2 check endpoint"
+    return 1
+  fi
+
+  echo "$response" | jq -r '.version // empty'
+}
+
 # Package configuration - PROPERLY DECLARE ASSOCIATIVE ARRAYS
+# ["1password"]="1password"
 declare -A FEED_TYPE=(
-    ["1password-cli-bin"]="1password"
+    ["1password-cli-bin"]="1password-cli2"
     ["github-cli"]="github"
     ["google-chrome-bin"]="chrome-stable"
     ["google-chrome-canary-bin"]="chrome-canary"
@@ -110,8 +125,9 @@ declare -A FEED_TYPE=(
     ["omnictl-bin"]="github"
 )
 
+# ["1password-wayland"]="https://releases.1password.com/linux/index.xml"
 declare -A FEED_URL=(
-    ["1password-cli-bin"]="https://releases.1password.com/linux/index.xml"
+    ["1password-cli-bin"]="https://app-updates.agilebits.com/check/1/0/CLI2/en/0/N"
     ["github-cli"]="https://github.com/cli/cli/releases.atom"
     ["google-chrome-bin"]=""
     ["google-chrome-canary-bin"]=""
@@ -163,6 +179,9 @@ fetch_latest_version() {
     log_info "Fetching version for $pkg (type: $type)"
 
     case "$type" in
+        "1password-cli2")
+            get_1password_cli2_version_json "$url" 2>/dev/null || echo ""
+            ;;
         "1password")
             get_1password_version "$url" 2>/dev/null || echo ""
             ;;
