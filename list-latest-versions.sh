@@ -114,6 +114,7 @@ declare -A FEED_TYPE=(
   ["kurtosis-cli-bin"]="github"
   ["talosctl-bin"]="github"
   ["omnictl-bin"]="github"
+  ["figma-linux-git"]="github"
 )
 # ["1password"]="https://releases.1password.com/linux/index.xml"
 declare -A FEED_URL=(
@@ -131,6 +132,7 @@ declare -A FEED_URL=(
   ["kurtosis-cli-bin"]="https://github.com/kurtosis-tech/kurtosis/releases.atom"
   ["talosctl-bin"]="https://github.com/siderolabs/talos/releases.atom"
   ["omnictl-bin"]="https://github.com/siderolabs/omni/releases.atom"
+  ["figma-linux-git"]="https://github.com/Figma-Linux/figma-linux/releases.atom"
 )
 
 is_vcs_package() {
