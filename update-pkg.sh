@@ -122,7 +122,10 @@ declare -A FEED_TYPE=(
     ["ktailctl"]="github"
     ["kurtosis-cli-bin"]="github"
     ["omnictl-bin"]="github"
+    ["figma-linux"]="github"
     ["figma-linux-git"]="github"
+    ["figma-linux-electron"]="github"
+    ["figma-linux-electron-git"]="github"
 )
 
 # ["1password-wayland"]="https://releases.1password.com/linux/index.xml"
@@ -140,7 +143,10 @@ declare -A FEED_URL=(
     ["ktailctl"]="https://github.com/f-koehler/KTailctl/releases.atom"
     ["kurtosis-cli-bin"]="https://github.com/kurtosis-tech/kurtosis/releases.atom"
     ["omnictl-bin"]="https://github.com/siderolabs/omni/releases.atom"
+    ["figma-linux"]="https://github.com/Figma-Linux/figma-linux/releases.atom"
     ["figma-linux-git"]="https://github.com/Figma-Linux/figma-linux/releases.atom"
+    ["figma-linux-electron"]="https://github.com/Figma-Linux/figma-linux/releases.atom"
+    ["figma-linux-electron-git"]="https://github.com/Figma-Linux/figma-linux/tags.atom"
 )
 
 # Debug function to show array contents
