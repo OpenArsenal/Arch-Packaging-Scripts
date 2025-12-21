@@ -224,80 +224,18 @@ get_current_pkgver() {
     fi
 }
 
-# Returns 0 only when the PKGBUILD is a "live" VCS build
-# (i.e., expected to change over time without editing the PKGBUILD).
+# Returns 0 (true) if this package should be treated as a "live VCS" build.
+# Returns 1 (false) otherwise.
 #
-# Rough rules:
-# - If pkg name ends in -git/-hg/-svn/-bzr => live VCS
-# - Otherwise, look for VCS URLs in source arrays:
-#   - If ANY VCS URL is unpinned (no fragment) or uses #branch=... => live VCS
-#   - If ALL VCS URLs are pinned (#tag= / #commit= / #revision= / #revision=...) => NOT live VCS
-#
-# Why these fragment keys?
-# makepkg explicitly supports fragment types like `branch`, `commit`, `tag` for git, etc. :contentReference[oaicite:1]{index=1}
-is_vcs_package() {
+# Assumptions:
+# - -git/-hg/-svn/-bzr means "live"
+# - -bin means "not live"
+# - everything else is "release/tag" style (even if it happens to fetch via git+...#tag=)
+is_live_vcs_package() {
   local pkg="$1"
-  local pkgbuild_path="$2"
 
-  # 1) Strong convention: -git/-hg/-svn/-bzr packages are intended to be live VCS.
+  [[ "$pkg" =~ -bin$ ]] && return 1
   [[ "$pkg" =~ -(git|hg|svn|bzr)$ ]] && return 0
-
-  # 2) Extract VCS-style URLs that makepkg recognizes (git+/hg+/svn+/bzr+).
-  #
-  # We intentionally keep this "dumb but effective":
-  # - Grab tokens starting with git+/hg+/svn+/bzr+
-  # - Stop at whitespace, quotes, or ')'
-  #
-  # This catches common patterns like:
-  #   "git+$url.git#tag=v$pkgver?signed"
-  #   "$_pkgname::git+$url.git"
-  local -a vcs_urls=()
-
-  # Grab tokens like:
-  #   git+https://...#tag=v1.2.3
-  #   name::git+https://...
-  #
-  # Using double-quotes avoids the brittle '\''
-  # Using timeout makes this impossible to “hang open” forever.
-  mapfile -t vcs_urls < <(
-    timeout 2s grep -oE "(git|hg|svn|bzr)\+[^\"'[:space:])]+"
-      "$pkgbuild_path" 2>/dev/null || true
-  )
-
-  # If there are no VCS URLs at all, it's not a VCS package.
-  ((${#vcs_urls[@]} == 0)) && return 1
-
-  # 3) Classify each VCS URL as pinned or live.
-  #
-  # Pinned:
-  #   - git supports #commit= and #tag= (and branch=) 
-  #   - svn uses #revision= 
-  #   - hg uses #revision= and #tag= 
-  #   - bzr uses #revision= 
-  #
-  # Live:
-  #   - #branch=... (still moves)
-  #   - no fragment at all (defaults to whatever upstream considers HEAD)
-  local url
-  for url in "${vcs_urls[@]}"; do
-    # Explicitly live
-    if [[ "$url" =~ \#branch= ]]; then
-      return 0
-    fi
-
-    # Explicitly pinned
-    if [[ "$url" =~ \#(tag|commit|revision)= ]]; then
-      continue
-    fi
-
-    # Has a VCS protocol but no fragment => live
-    # (source='git+https://...') is a moving target by default.
-    if [[ "$url" =~ ^(git|hg|svn|bzr)\+ ]]; then
-      return 0
-    fi
-  done
-
-  # If we got here, every VCS URL we saw was pinned.
   return 1
 }
 
@@ -409,7 +347,7 @@ update_package() {
         return 1
     fi
 
-    if is_vcs_package "$pkg" "$pkgbuild_path"; then
+    if is_live_vcs_package "$pkg" "$pkgbuild_path"; then
         log_info "$pkg looks like a VCS package; skipping PKGBUILD version bump and just building."
         update_checksums "$pkg_dir" || true
         build_package "$pkg_dir"
