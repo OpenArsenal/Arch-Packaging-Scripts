@@ -106,6 +106,19 @@ get_1password_cli2_version_json() {
   echo "$response" | jq -r '.version // empty'
 }
 
+get_lmstudio_version() {
+    local url="$1"
+    
+    # Fetch RSS feed and extract version from titles
+    # Pattern: <title><![CDATA[LM Studio X.Y.Z]]></title>
+    # RSS feeds are typically reverse chronological, so first match is latest
+    fetch "$url" | \
+        grep -oP '<title><!\[CDATA\[LM Studio [0-9]+\.[0-9]+\.[0-9]+\]\]></title>' | \
+        head -1 | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | \
+        head -1
+}
+
 # Package configuration - PROPERLY DECLARE ASSOCIATIVE ARRAYS
 # ["1password"]="1password"
 declare -A FEED_TYPE=(
@@ -116,6 +129,7 @@ declare -A FEED_TYPE=(
     ["github-cli"]="github"
     ["google-chrome-bin"]="chrome-stable"
     ["google-chrome-canary-bin"]="chrome-canary"
+    ["lmstudio-bin"]="lmstudio"
     ["microsoft-edge-stable-bin"]="edge"
     ["visual-studio-code-bin"]="vscode"
     ["vesktop"]="github"
@@ -140,6 +154,7 @@ declare -A FEED_URL=(
     ["github-cli"]="https://github.com/cli/cli/releases.atom"
     ["google-chrome-bin"]=""
     ["google-chrome-canary-bin"]=""
+    ["lmstudio-bin"]="https://lmstudio.ai/rss.xml"
     ["microsoft-edge-stable-bin"]="https://packages.microsoft.com/yumrepos/edge/repodata/repomd.xml"
     ["visual-studio-code-bin"]=""
     ["vesktop"]="https://github.com/Vencord/Vesktop/releases.atom"
@@ -199,6 +214,9 @@ fetch_latest_version() {
             ;;
         "github")
             get_github_version "$url" 2>/dev/null || echo ""
+            ;;
+        "lmstudio")
+            get_lmstudio_version "$url" 2>/dev/null || echo ""
             ;;
         "vscode")
             get_vscode_version 2>/dev/null || echo ""
@@ -457,6 +475,7 @@ OPTIONS:
 EXAMPLES:
     $0                      Update all packages
     $0 kurtosis-cli-bin     Update only kurtosis-cli-bin
+    $0 lmstudio-bin         Update only lmstudio-bin
     $0 --dry-run            Show what would be updated
     $0 --list               List all available packages
     $0 --debug              Show debug info about arrays
