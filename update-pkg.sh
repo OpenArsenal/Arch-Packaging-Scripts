@@ -107,16 +107,39 @@ get_1password_cli2_version_json() {
 }
 
 get_lmstudio_version() {
-    local url="$1"
+    log_info "Fetching version from download page..."
     
-    # Fetch RSS feed and extract version from titles
-    # Pattern: <title><![CDATA[LM Studio X.Y.Z]]></title>
-    # RSS feeds are typically reverse chronological, so first match is latest
-    fetch "$url" | \
-        grep -oP '<title><!\[CDATA\[LM Studio [0-9]+\.[0-9]+\.[0-9]+\]\]></title>' | \
-        head -1 | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | \
-        head -1
+    local html
+    html=$(curl -sSL --max-time 5 "https://lmstudio.ai/download" 2>/dev/null)
+    
+    if [[ -z "$html" ]]; then
+        log_error "Failed to fetch download page"
+        return 1
+    fi
+    
+    # Extract version from the versionsData JSON embedded in the page  
+    # Use Python for reliable regex matching with escaped quotes
+    local result
+    result=$(echo "$html" | python3 -c "
+import sys, re
+html = sys.stdin.read()
+match = re.search(r'\\\\\"linux\\\\\":\{\\\\\"x64\\\\\":\{\\\\\"version\\\\\":\\\\\"([0-9.]+)\\\\\",\\\\\"build\\\\\":\\\\\"([0-9]+)\\\\\"', html)
+if match:
+    print(f'{match.group(1)}.{match.group(2)}')
+" 2>/dev/null)
+    
+    if [[ -n "$result" ]]; then
+        version="${result%.*}"
+        build="${result##*.}"
+        
+        log_success "Found LM Studio ${version}-${build}"
+        # Return in dot notation for Arch pkgver
+        echo "$result"
+        return 0
+    else
+        log_error "Could not parse version from download page"
+        return 1
+    fi
 }
 
 # Package configuration - PROPERLY DECLARE ASSOCIATIVE ARRAYS
@@ -216,7 +239,8 @@ fetch_latest_version() {
             get_github_version "$url" 2>/dev/null || echo ""
             ;;
         "lmstudio")
-            get_lmstudio_version "$url" 2>/dev/null || echo ""
+            # Don't suppress stderr - we want to see probe progress
+            get_lmstudio_version || echo ""
             ;;
         "vscode")
             get_vscode_version 2>/dev/null || echo ""
