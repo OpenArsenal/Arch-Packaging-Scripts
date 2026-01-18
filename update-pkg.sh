@@ -39,10 +39,36 @@ get_1password_version() {
 
 get_github_version() {
     local url="$1"
-    fetch "$url" | \
-        xmlstarlet sel -N atom="http://www.w3.org/2005/Atom" \
-            -t -v "//atom:entry[1]/atom:title" | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+    local channel="${2:-any}"  # any, stable, or prerelease
+    
+    # Extract owner/repo from atom feed URL
+    local repo
+    repo=$(echo "$url" | grep -oP 'github\.com/\K[^/]+/[^/]+')
+    
+    if [[ -z "$repo" ]]; then
+        log_error "Could not extract repo from URL: $url"
+        return 1
+    fi
+    
+    case "$channel" in
+        "stable")
+            # Use /releases/latest which excludes prereleases
+            local api_url="https://api.github.com/repos/${repo}/releases/latest"
+            fetch "$api_url" | jq -r '.tag_name' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+            ;;
+        "prerelease")
+            # Get first release that IS a prerelease
+            local api_url="https://api.github.com/repos/${repo}/releases"
+            fetch "$api_url" | jq -r '.[] | select(.prerelease == true) | .tag_name' | \
+                grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+            ;;
+        "any"|*)
+            # Get latest regardless of prerelease status
+            local api_url="https://api.github.com/repos/${repo}/releases"
+            fetch "$api_url" | jq -r '.[0].tag_name' | \
+                grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+            ;;
+    esac
 }
 
 get_vscode_version() {
@@ -145,27 +171,38 @@ if match:
 # Package configuration - PROPERLY DECLARE ASSOCIATIVE ARRAYS
 # ["1password"]="1password"
 declare -A FEED_TYPE=(
-    ["1password-cli-bin"]="1password-cli2"
-    ["calibre"]="github"
-    ["calibre-bin"]="github"
+    # Stable GitHub releases
+    ["calibre"]="github-stable"
+    ["calibre-bin"]="github-stable"
+    ["ollama"]="github-stable"
+    ["github-cli"]="github-stable"
+    ["vesktop"]="github-stable"
+    ["vesktop-electron"]="github-stable"
+    ["ktailctl"]="github-stable"
+    ["kurtosis-cli-bin"]="github-stable"
+    ["omnictl-bin"]="github-stable"
+    ["figma-linux"]="github-stable"
+    ["figma-linux-electron"]="github-stable"
+    
+    # Any GitHub release (including prereleases)
     ["calibre-git"]="github"
-    ["github-cli"]="github"
+    ["vesktop-git"]="github"
+    ["vesktop-electron-git"]="github"
+    ["figma-linux-git"]="github"
+    ["figma-linux-electron-git"]="github"
+    
+    # Explicit prerelease (if you ever need it)
+    # ["some-package-beta"]="github-prerelease"
+    
+    # Chrome channels (already using this pattern)
     ["google-chrome-bin"]="chrome-stable"
     ["google-chrome-canary-bin"]="chrome-canary"
+    
+    # Other types stay the same
+    ["1password-cli-bin"]="1password-cli2"
     ["lmstudio-bin"]="lmstudio"
     ["microsoft-edge-stable-bin"]="edge"
     ["visual-studio-code-bin"]="vscode"
-    ["vesktop"]="github"
-    ["vesktop-git"]="github"
-    ["vesktop-electron"]="github"
-    ["vesktop-electron-git"]="github"
-    ["ktailctl"]="github"
-    ["kurtosis-cli-bin"]="github"
-    ["omnictl-bin"]="github"
-    ["figma-linux"]="github"
-    ["figma-linux-git"]="github"
-    ["figma-linux-electron"]="github"
-    ["figma-linux-electron-git"]="github"
 )
 
 # ["1password-wayland"]="https://releases.1password.com/linux/index.xml"
@@ -174,6 +211,7 @@ declare -A FEED_URL=(
     ["calibre"]="https://github.com/kovidgoyal/calibre/releases.atom"
     ["calibre-bin"]="https://github.com/kovidgoyal/calibre/releases.atom"
     ["calibre-git"]="https://github.com/kovidgoyal/calibre/tags.atom"
+    ["ollama"]="https://github.com/ollama/ollama/releases.atom"
     ["github-cli"]="https://github.com/cli/cli/releases.atom"
     ["google-chrome-bin"]=""
     ["google-chrome-canary-bin"]=""
@@ -217,7 +255,6 @@ debug_arrays() {
 fetch_latest_version() {
     local pkg="$1"
 
-    # Check if package exists in our arrays
     if [[ -z "${FEED_TYPE[$pkg]:-}" ]]; then
         log_error "Package '$pkg' not found in FEED_TYPE array"
         return 1
@@ -236,10 +273,15 @@ fetch_latest_version() {
             get_1password_version "$url" 2>/dev/null || echo ""
             ;;
         "github")
-            get_github_version "$url" 2>/dev/null || echo ""
+            get_github_version "$url" "any" 2>/dev/null || echo ""
+            ;;
+        "github-stable")
+            get_github_version "$url" "stable" 2>/dev/null || echo ""
+            ;;
+        "github-prerelease")
+            get_github_version "$url" "prerelease" 2>/dev/null || echo ""
             ;;
         "lmstudio")
-            # Don't suppress stderr - we want to see probe progress
             get_lmstudio_version || echo ""
             ;;
         "vscode")
