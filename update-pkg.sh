@@ -176,6 +176,9 @@ declare -A FEED_TYPE=(
     ["calibre-bin"]="github-stable"
     ["ollama"]="github-stable"
     ["ollama-bin"]="github-stable"
+    ["alpaca"]="github-stable"
+    ["alpaca-git"]="github-stable"
+    ["alpaka-git"]="unknown"
     ["github-cli"]="github-stable"
     ["vesktop"]="github-stable"
     ["vesktop-electron"]="github-stable"
@@ -214,6 +217,9 @@ declare -A FEED_URL=(
     ["calibre-git"]="https://github.com/kovidgoyal/calibre/tags.atom"
     ["ollama"]="https://github.com/ollama/ollama/releases.atom"
     ["ollama-bin"]="https://github.com/ollama/ollama/releases.atom"
+    ["alpaca"]="https://github.com/jeffser/alpaca/releases.atom"
+    ["alpaca-git"]="https://github.com/jeffser/alpaca/releases.atom"
+    ["alpaka-git"]=""
     ["github-cli"]="https://github.com/cli/cli/releases.atom"
     ["google-chrome-bin"]=""
     ["google-chrome-canary-bin"]=""
@@ -297,6 +303,9 @@ fetch_latest_version() {
             ;;
         "edge")
             get_edge_version "$url" 2>/dev/null || echo ""
+            ;;
+        "unknown")
+            echo ""
             ;;
         *)
             log_error "Unknown feed type: $type"
