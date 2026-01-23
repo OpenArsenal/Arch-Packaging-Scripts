@@ -28,6 +28,38 @@ log_warning() { echo -e "${YELLOW}[WARNING]${NC} $*" >&2; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_debug() { [[ "${DEBUG:-false}" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2; }
 
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  log_error "Do not run this script as root. \`makepkg\` refuses to run as root."
+  log_info "Run without \`sudo\`: ./scripts/update-pkg.sh" 
+  exit 1
+fi
+
+SUDO_KEEPALIVE_PID=""
+
+sudo_keepalive_start() {
+  # Cache credentials now (one prompt), then keep them alive.
+  sudo -v || return 1
+
+  # Keep sudo timestamp alive until script exits.
+  # -n: never prompt again (if it expires, this loop will fail silently)
+  (
+    while true; do
+      sudo -n true >/dev/null 2>&1 || exit 0
+      sleep 60
+    done
+  ) &
+  SUDO_KEEPALIVE_PID="$!"
+}
+
+sudo_keepalive_stop() {
+  if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+  fi
+}
+
+trap 'sudo_keepalive_stop' EXIT INT TERM
+
+
 declare -r SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 declare -r PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 declare -r DEFAULT_FEEDS_JSON="$PROJECT_ROOT/feeds.json"
@@ -68,6 +100,52 @@ check_deps() {
     exit 1
   fi
 }
+
+# interactive prompts
+
+declare INTERACTIVE="true"
+declare YES_ALL="false"
+
+read_choice_tty() {
+  # Read from terminal even if stdout is piped.
+  local out_var="$1"
+  local prompt="$2"
+  local choice=""
+  printf "%s" "$prompt" >/dev/tty
+  IFS= read -r choice </dev/tty || choice=""
+  printf -v "$out_var" "%s" "$choice"
+}
+
+confirm_action() {
+  # Returns 0 to proceed, 1 to skip, exits on quit.
+  local pkg="$1"
+  local current="$2"
+  local upstream="$3"
+  local action="$4" # e.g. "update", "build"
+
+  if [[ "$INTERACTIVE" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ "$YES_ALL" == "true" ]]; then
+    return 0
+  fi
+
+  local ans=""
+  while true; do
+    read_choice_tty ans \
+      "[PROMPT] ${pkg}: ${action} (${current:-n/a} -> ${upstream:-n/a})? [y]es/[n]o/[a]ll/[q]uit: "
+
+    case "${ans,,}" in
+      y|"") return 0 ;;
+      n) return 1 ;;
+      a) YES_ALL="true"; return 0 ;;
+      q) log_error "Aborted by user."; exit 1 ;;
+      *) ;;
+    esac
+  done
+}
+
 
 # -------- feeds.json helpers (schema-aware) --------
 
@@ -466,10 +544,28 @@ update_pkgbuild_version() {
   clean_version="$(trim "$new_version")"
   clean_version="${clean_version//-/_}"
 
-  cp "$pkgbuild_path" "${pkgbuild_path}.backup"
+  if [[ ! -w "$(dirname "$pkgbuild_path")" ]]; then
+    log_warning "Not writable: $(dirname "$pkgbuild_path")"
+    log_warning "Fix ownership/permissions, e.g.: sudo chown -R \$USER:\$USER '$(dirname "$pkgbuild_path")'"
+    return 1
+  fi
 
-  sed -i -E "s/^pkgver=.*/pkgver='${clean_version//&/\\&}'/" "$pkgbuild_path"
-  sed -i -E "s/^pkgrel=.*/pkgrel=1/" "$pkgbuild_path"
+  if ! cp "$pkgbuild_path" "${pkgbuild_path}.backup" 2>/dev/null; then
+    log_warning "Failed to write backup: ${pkgbuild_path}.backup"
+    return 1
+  fi
+
+  if ! sed -i -E "s/^pkgver=.*/pkgver='${clean_version//&/\\&}'/" "$pkgbuild_path"; then
+    log_warning "Failed to update pkgver in $pkgbuild_path"
+    return 1
+  fi
+
+  if ! sed -i -E "s/^pkgrel=.*/pkgrel=1/" "$pkgbuild_path"; then
+    log_warning "Failed to update pkgrel in $pkgbuild_path"
+    return 1
+  fi
+
+  return 0
 }
 
 update_checksums() {
@@ -556,22 +652,40 @@ show_usage() {
   cat <<EOF
 Usage: $0 [OPTIONS] [PACKAGES...]
 
+Update/build AUR-style PKGBUILDs using feeds.json as the source of truth.
+
+By default, when run in a terminal, the script will prompt per package before
+applying updates (with an option to accept all remaining prompts).
+
 OPTIONS:
   --feeds <path>        Path to feeds.json (default: $DEFAULT_FEEDS_JSON)
+
   --dry-run             Print CURRENT vs UPSTREAM and exit (no changes)
   --list                List packages from feeds.json and exit
+
   --no-build            Update PKGBUILD/updpkgsums but skip makepkg
   --build-only          Only build; do not version-bump
   --clean               Remove src/pkg/*.pkg.tar.* before building
+
   --strict              Exit non-zero if feeds.json entries are missing directories/PKGBUILDs
   --debug               Extra diagnostics (shows feed types, repos, API calls)
-  -h, --help            Show this help
 
-Examples:
+  --no-prompt           Non-interactive mode (never ask questions)
+  -y, --yes             Assume "yes" for all prompts (equivalent to non-interactive)
+
+PROMPTS:
+  When prompting is enabled, each package update/build prompt accepts:
+    y = yes (default), n = no (skip), a = yes to all remaining, q = quit
+
+EXAMPLES:
   $0 --dry-run
-  $0 --dry-run --debug
   $0 --dry-run --strict
   $0 github-cli ktailctl
+  $0 --no-build
+  $0 --build-only --clean
+  $0 -y
+  $0 --no-prompt
+
 EOF
 }
 
@@ -588,6 +702,8 @@ while [[ $# -gt 0 ]]; do
     --strict) STRICT="true"; shift ;;
     --list) LIST_ONLY="true"; shift ;;
     --debug) DEBUG="true"; shift ;;
+    --no-prompt) INTERACTIVE="false"; shift ;;
+    -y|--yes) YES_ALL="true"; INTERACTIVE="false"; shift ;;
     -h|--help) show_usage; exit 0 ;;
     -*)
       log_error "Unknown option: $1"
@@ -600,6 +716,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+  INTERACTIVE="false"
+fi
+
 
 main() {
   [[ ! -f "$FEEDS_JSON" ]] && log_error "feeds.json not found: $FEEDS_JSON" && exit 1
@@ -668,6 +789,12 @@ main() {
     exit 1
   fi
 
+  if [[ "$DRY_RUN" != "true" && "$NO_BUILD" != "true" ]]; then
+    # Ask once up front so makepkg/pacman won't repeatedly prompt.
+    log_info "Authenticating sudo once for dependency installs during builds..."
+    sudo_keepalive_start || { log_error "sudo authentication failed"; exit 1; }
+  fi
+
   print_table_header
 
   local -a failed=()
@@ -726,32 +853,51 @@ main() {
 
     # Actual update/build logic
     if [[ ! -d "$dir" || ! -f "$pkgb" ]]; then
-      failed+=("$pkg")
+      log_warning "Skipping $pkg (missing directory or PKGBUILD: $dir)"
+      # Only mark as failure if --strict is enabled
+      if [[ "$STRICT" == "true" ]]; then
+        failed+=("$pkg")
+      fi
       continue
     fi
 
     if [[ "$BUILD_ONLY" == "true" ]]; then
       if [[ "$CLEAN_BUILD" == "true" ]]; then
-        rm -rf "$dir/src" "$dir/pkg" "$dir"/*.pkg.tar.* >/dev/null 2>&1 || true
+        rm -rf "$dir/src" "$dir/pkg" "$dir"/*.pkg.tar.* >"$dir/.update-pkg.build.log" 2>&1 || true
       fi
-      if ! build_package "$dir" >/dev/null 2>&1; then
+      if ! build_package "$dir" >"$dir/.update-pkg.build.log" 2>&1; then
+        log_error "Build failed for $pkg (see $dir/.update-pkg.build.log)"
         failed+=("$pkg")
       fi
       continue
     fi
 
     if [[ "$status" == "UPDATE" && "$is_vcs" != "true" && "$is_manual" != "true" && -n "$upstream" ]]; then
-      update_pkgbuild_version "$pkgb" "$upstream" || { failed+=("$pkg"); continue; }
-      update_checksums "$dir" || true
-      ((updated++))
+      if confirm_action "$pkg" "$current" "$upstream" "update"; then
+        update_pkgbuild_version "$pkgb" "$upstream" || { failed+=("$pkg"); continue; }
+        update_checksums "$dir" || true
+        ((updated++))
+      else
+        log_info "Skipped update for $pkg"
+        continue
+      fi
     fi
 
     if [[ "$NO_BUILD" != "true" ]]; then
-      if [[ "$CLEAN_BUILD" == "true" ]]; then
-        rm -rf "$dir/src" "$dir/pkg" "$dir"/*.pkg.tar.* >/dev/null 2>&1 || true
-      fi
-      if ! build_package "$dir" >/dev/null 2>&1; then
-        failed+=("$pkg")
+      # Only build if we updated PKGBUILD in this run OR user is in --build-only mode.
+      # Your current code builds everything; if you want that, keep it. If not, gate it.
+      if [[ "$status" == "UPDATE" ]]; then
+        if confirm_action "$pkg" "$current" "$upstream" "build"; then
+          if [[ "$CLEAN_BUILD" == "true" ]]; then
+            rm -rf "$dir/src" "$dir/pkg" "$dir"/*.pkg.tar.* >"$dir/.update-pkg.build.log" 2>&1 || true
+          fi
+          if ! build_package "$dir" >"$dir/.update-pkg.build.log" 2>&1; then
+            log_error "Build failed for $pkg (see $dir/.update-pkg.build.log)"
+            failed+=("$pkg")
+          fi
+        else
+          log_info "Skipped build for $pkg"
+        fi
       fi
     fi
   done
