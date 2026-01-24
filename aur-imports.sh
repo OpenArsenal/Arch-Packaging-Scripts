@@ -4,10 +4,10 @@ set -uo pipefail
 # Clone AUR packages into repo root, strip .git, and add/update feeds.json entries.
 #
 # Examples:
-#   ./scripts/aur-import.sh https://aur.archlinux.org/google-chrome-canary-bin.git
-#   ./scripts/aur-import.sh google-chrome-canary-bin
-#   ./scripts/aur-import.sh 1password-wayland --type manual
-#   ./scripts/aur-import.sh somepkg --infer
+#   ./scripts/aur-imports.sh https://aur.archlinux.org/google-chrome-canary-bin.git
+#   ./scripts/aur-imports.sh google-chrome-canary-bin
+#   ./scripts/aur-imports.sh 1password-wayland --type manual
+#   ./scripts/aur-imports.sh somepkg --infer
 #
 # Notes:
 # - Default feed type is "manual" unless inference finds a GitHub repo.
@@ -81,19 +81,66 @@ aur_name_from_url_or_name() {
 infer_github_repo_from_pkgbuild() {
   local pkgbuild_path="$1"
 
-  # Try url="https://github.com/owner/repo"
-  local url_line
-  url_line="$(grep -E '^[[:space:]]*url=' "$pkgbuild_path" | head -n 1 || true)"
-  [[ -z "$url_line" ]] && echo "" && return 0
+  # Strategy: check multiple sources for GitHub repos, in priority order:
+  # 1. Explicit repo= variable (common in VCS packages)
+  # 2. git+ sources in source=() array
+  # 3. url= variable (general project URL)
 
-  python3 - "$url_line" <<'PY'
-import re, sys
-line = sys.argv[1]
-m = re.search(r'https?://github\.com/([^/\s"]+)/([^/\s"]+)', line)
-if not m:
-  sys.exit(2)
-print(f"{m.group(1)}/{m.group(2)}")
+  [[ ! -f "$pkgbuild_path" ]] && echo "" && return 0
+
+  local content
+  content="$(cat "$pkgbuild_path" 2>/dev/null)" || { echo ""; return 0; }
+
+  python3 - "$content" <<'PY'
+import re
+import sys
+
+content = sys.argv[1]
+
+# Strategy 1: Look for explicit repo= variable
+# Example: repo="https://github.com/logseq/logseq.git"
+repo_match = re.search(r'^[^\#]*\brepo\s*=\s*["\']?(https?://github\.com/([^/\s"\']+)/([^/\s"\'\.]+))', content, re.MULTILINE)
+if repo_match:
+    print(f"{repo_match.group(2)}/{repo_match.group(3)}")
+    sys.exit(0)
+
+# Strategy 2: Look for git+ sources in source=() array
+# Example: source=("pkg::git+https://github.com/owner/repo.git#branch=main")
+git_source_match = re.search(r'git\+https?://github\.com/([^/\s"\']+)/([^/\s"\'\.]+)', content)
+if git_source_match:
+    print(f"{git_source_match.group(1)}/{git_source_match.group(2)}")
+    sys.exit(0)
+
+# Strategy 3: Look for url= variable
+# Example: url="https://github.com/owner/repo"
+url_match = re.search(r'^[^\#]*\burl\s*=\s*["\']?(https?://github\.com/([^/\s"\']+)/([^/\s"\']+))', content, re.MULTILINE)
+if url_match:
+    print(f"{url_match.group(2)}/{url_match.group(3)}")
+    sys.exit(0)
+
+# No GitHub repo found
+sys.exit(2)
 PY
+}
+
+infer_feed_type_from_context() {
+  local pkg="$1"
+  local inferred_repo="$2"
+  
+  # VCS packages: -git, -hg, -svn, -bzr suffix
+  if [[ "$pkg" =~ -(git|hg|svn|bzr)$ ]]; then
+    echo "vcs"
+    return 0
+  fi
+  
+  # If we found a GitHub repo, default to github-release
+  if [[ -n "$inferred_repo" ]]; then
+    echo "github-release"
+    return 0
+  fi
+  
+  # Fallback to manual
+  echo "manual"
 }
 
 ensure_feeds_json_exists() {
@@ -254,15 +301,16 @@ main() {
 
     if [[ "$INFER" == "true" ]]; then
       inferred_repo="$(infer_github_repo_from_pkgbuild "$pkgb" 2>/dev/null || true)"
+      
+      if [[ -n "$inferred_repo" ]]; then
+        log_info "Inferred GitHub repo: $inferred_repo"
+      else
+        log_warning "Could not infer GitHub repo from PKGBUILD"
+      fi
 
       if [[ -z "$inferred_type" ]]; then
-        if [[ "$pkg" =~ -(git|hg|svn|bzr)$ ]]; then
-          inferred_type="vcs"
-        elif [[ -n "$inferred_repo" ]]; then
-          inferred_type="github-release"
-        else
-          inferred_type="manual"
-        fi
+        inferred_type="$(infer_feed_type_from_context "$pkg" "$inferred_repo")"
+        log_info "Inferred feed type: $inferred_type"
       fi
     fi
 
