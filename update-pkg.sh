@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Update/build AUR-style PKGBUILDs from a single source of truth: feeds.json
+# update-pkg.sh - Version detection ONLY (no building)
 #
-# Supports both schemaVersion 1 (nested .feed) and schemaVersion 2 (flat structure)
+# Detects which packages need updates by comparing local PKGBUILDs with remote sources.
+# Does NOT build packages - use build-packages.sh for that.
+#
+# Supports feeds.json schema v1 and v2 with multiple source types:
+#   - chrome, edge, vscode (browser/editor binaries)
+#   - github-release, github-release-filtered, github-tags-filtered
+#   - 1password-cli2, 1password-linux-stable, lmstudio
+#   - vcs (VCS packages like -git, -hg, -svn)
+#   - manual (no auto-detection)
 #
 # Examples:
-#   ./scripts/update-pkg.sh --dry-run
-#   ./scripts/update-pkg.sh --dry-run --strict
-#   ./scripts/update-pkg.sh --list
-#   ./scripts/update-pkg.sh github-cli ktailctl
-#   ./scripts/update-pkg.sh --no-build
-#   ./scripts/update-pkg.sh --build-only
+#   ./scripts/update-pkg.sh --dry-run              # Check all packages
+#   ./scripts/update-pkg.sh --list-outdated        # List packages needing updates
+#   ./scripts/update-pkg.sh ktailctl               # Check specific package
+#   ./scripts/update-pkg.sh --json                 # JSON output for scripting
 #
 # Optional:
-#   export GITHUB_TOKEN="..."  # reduces GitHub rate-limit pain
+#   export GITHUB_TOKEN="..."  # Reduces GitHub API rate limiting
 
 declare -r RED='\033[0;31m'
 declare -r GREEN='\033[0;32m'
@@ -28,37 +34,9 @@ log_warning() { echo -e "${YELLOW}[WARNING]${NC} $*" >&2; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_debug() { [[ "${DEBUG:-false}" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2; }
 
-if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  log_error "Do not run this script as root. \`makepkg\` refuses to run as root."
-  log_info "Run without \`sudo\`: ./scripts/update-pkg.sh" 
-  exit 1
-fi
-
-SUDO_KEEPALIVE_PID=""
-
-sudo_keepalive_start() {
-  # Cache credentials now (one prompt), then keep them alive.
-  sudo -v || return 1
-
-  # Keep sudo timestamp alive until script exits.
-  # -n: never prompt again (if it expires, this loop will fail silently)
-  (
-    while true; do
-      sudo -n true >/dev/null 2>&1 || exit 0
-      sleep 60
-    done
-  ) &
-  SUDO_KEEPALIVE_PID="$!"
-}
-
-sudo_keepalive_stop() {
-  if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
-    kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
-  fi
-}
-
-trap 'sudo_keepalive_stop' EXIT INT TERM
-
+# ============================================================================
+# Configuration
+# ============================================================================
 
 declare -r SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 declare -r PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -66,10 +44,15 @@ declare -r DEFAULT_FEEDS_JSON="$PROJECT_ROOT/feeds.json"
 declare -r PACKAGE_UPDATE_BOT_USER_AGENT="Package-Update-Bot/1.0"
 declare -r FETCH_TIMEOUT=30
 
+# ============================================================================
+# Network Helpers
+# ============================================================================
+
 fetch() {
   local url="${1:-}"
   [[ -z "$url" ]] && return 1
   
+  # Use GitHub token if available for API requests
   if [[ -n "${GITHUB_TOKEN:-}" && "$url" == https://api.github.com/* ]]; then
     curl -sSL --max-time "$FETCH_TIMEOUT" \
       -A "$PACKAGE_UPDATE_BOT_USER_AGENT" \
@@ -82,72 +65,9 @@ fetch() {
   curl -sSL --max-time "$FETCH_TIMEOUT" -A "$PACKAGE_UPDATE_BOT_USER_AGENT" "$url" 2>/dev/null
 }
 
-check_deps() {
-  local -a missing=()
-
-  command -v jq >/dev/null 2>&1 || missing+=("jq")
-  command -v curl >/dev/null 2>&1 || missing+=("curl")
-  command -v git >/dev/null 2>&1 || missing+=("git")
-  command -v makepkg >/dev/null 2>&1 || missing+=("base-devel")
-  command -v updpkgsums >/dev/null 2>&1 || missing+=("pacman-contrib")
-  command -v vercmp >/dev/null 2>&1 || true
-  command -v python3 >/dev/null 2>&1 || missing+=("python")
-  command -v xmllint >/dev/null 2>&1 || missing+=("libxml2")
-
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    log_error "Missing dependencies: ${missing[*]}"
-    log_info "Install with: sudo pacman -S ${missing[*]}"
-    exit 1
-  fi
-}
-
-# interactive prompts
-
-declare INTERACTIVE="true"
-declare YES_ALL="false"
-
-read_choice_tty() {
-  # Read from terminal even if stdout is piped.
-  local out_var="$1"
-  local prompt="$2"
-  local choice=""
-  printf "%s" "$prompt" >/dev/tty
-  IFS= read -r choice </dev/tty || choice=""
-  printf -v "$out_var" "%s" "$choice"
-}
-
-confirm_action() {
-  # Returns 0 to proceed, 1 to skip, exits on quit.
-  local pkg="$1"
-  local current="$2"
-  local upstream="$3"
-  local action="$4" # e.g. "update", "build"
-
-  if [[ "$INTERACTIVE" != "true" ]]; then
-    return 0
-  fi
-
-  if [[ "$YES_ALL" == "true" ]]; then
-    return 0
-  fi
-
-  local ans=""
-  while true; do
-    read_choice_tty ans \
-      "[PROMPT] ${pkg}: ${action} (${current:-n/a} -> ${upstream:-n/a})? [y]es/[n]o/[a]ll/[q]uit: "
-
-    case "${ans,,}" in
-      y|"") return 0 ;;
-      n) return 1 ;;
-      a) YES_ALL="true"; return 0 ;;
-      q) log_error "Aborted by user."; exit 1 ;;
-      *) ;;
-    esac
-  done
-}
-
-
-# -------- feeds.json helpers (schema-aware) --------
+# ============================================================================
+# feeds.json Helpers (Schema-Aware)
+# ============================================================================
 
 feeds_json_get_schema_version() {
   local feeds_json="${1:-}"
@@ -183,7 +103,6 @@ feeds_json_get_field() {
   fi
 }
 
-# Returns 0 if feeds.json contains an entry for pkg
 feeds_json_has_pkg() {
   local feeds_json="${1:-}"
   local pkg="${2:-}"
@@ -191,7 +110,9 @@ feeds_json_has_pkg() {
   jq -e --arg name "$pkg" '.packages[] | select(.name==$name) | .name' "$feeds_json" >/dev/null 2>&1
 }
 
-# -------- version normalization / extraction --------
+# ============================================================================
+# Version Normalization / Extraction
+# ============================================================================
 
 trim() {
   local s="${1:-}"
@@ -199,19 +120,16 @@ trim() {
 }
 
 normalize_basic_tag_to_version() {
-  # Accept either:
-  #  - a single arg (preferred), or
-  #  - stdin (when used in a pipe)
+  # Accept either single arg or stdin (for pipe usage)
   local raw=""
 
   if [[ $# -gt 0 ]]; then
     raw="${1:-}"
   else
-    # Read everything from stdin (not just one line) to be safe
     raw="$(cat || true)"
   fi
 
-  # Normalize whitespace/newlines (common from APIs)
+  # Normalize whitespace/newlines, strip common prefixes
   raw="${raw//$'\r'/}"
   raw="${raw//$'\n'/}"
   raw="${raw#refs/tags/}"
@@ -261,6 +179,7 @@ pick_max_version_list() {
     return 0
   fi
 
+  # Use vercmp if available for accurate version comparison
   if command -v vercmp >/dev/null 2>&1; then
     local max="${versions[0]}"
     local v
@@ -273,15 +192,20 @@ pick_max_version_list() {
     return 0
   fi
 
+  # Fallback to sort -V
   printf "%s\n" "${versions[@]}" | sort -V | tail -n 1
 }
 
-# -------- upstream version fetchers --------
+# ============================================================================
+# Upstream Version Fetchers
+# ============================================================================
 
 github_latest_release_tag() {
   local repo="${1:-}"
   local channel="${2:-stable}"
   [[ -z "$repo" ]] && return 0
+
+  log_debug "github_latest_release_tag: repo=$repo, channel=$channel"
 
   local url=""
   case "$channel" in
@@ -294,19 +218,30 @@ github_latest_release_tag() {
   esac
 
   local response
-  response="$(fetch "$url")" || return 1
+  response="$(fetch "$url")" || {
+    log_debug "Failed to fetch from GitHub API: $url"
+    return 1
+  }
   
+  local result
   case "$channel" in
     stable)
-      echo "$response" | jq -r '.tag_name // empty'
+      result=$(echo "$response" | jq -r '.tag_name // empty')
       ;;
     prerelease)
-      echo "$response" | jq -r '[.[] | select(.prerelease==true)][0].tag_name // empty'
+      result=$(echo "$response" | jq -r '[.[] | select(.prerelease==true)][0].tag_name // empty')
       ;;
     any|*)
-      echo "$response" | jq -r '.[0].tag_name // empty'
+      result=$(echo "$response" | jq -r '.[0].tag_name // empty')
       ;;
   esac
+
+  if [[ -z "$result" && "${DEBUG:-false}" == "true" ]]; then
+    log_debug "No tag_name found in API response"
+    log_debug "Response snippet: $(echo "$response" | jq -c . | head -c 200)..."
+  fi
+
+  echo "$result"
 }
 
 github_latest_release_tag_filtered() {
@@ -315,26 +250,46 @@ github_latest_release_tag_filtered() {
   local tag_regex="${3:-}"
   [[ -z "$repo" || -z "$tag_regex" ]] && return 1
 
-  local releases
-  releases="$(fetch "https://api.github.com/repos/${repo}/releases?per_page=50")" || return 1
+  log_debug "github_latest_release_tag_filtered: repo=$repo, channel=$channel, tag_regex=$tag_regex"
 
+  local releases
+  releases="$(fetch "https://api.github.com/repos/${repo}/releases?per_page=50")" || {
+    log_debug "Failed to fetch releases from GitHub API"
+    return 1
+  }
+
+  local total_releases
+  total_releases=$(echo "$releases" | jq -r '.[] | .tag_name' | wc -l)
+  log_debug "Found $total_releases total releases"
+
+  local result
   case "$channel" in
     stable)
-      echo "$releases" | jq -r --arg re "$tag_regex" '
+      result=$(echo "$releases" | jq -r --arg re "$tag_regex" '
         [.[] | select(.prerelease==false) | select(.tag_name | test($re))][0].tag_name // empty
-      '
+      ')
       ;;
     prerelease)
-      echo "$releases" | jq -r --arg re "$tag_regex" '
+      result=$(echo "$releases" | jq -r --arg re "$tag_regex" '
         [.[] | select(.prerelease==true) | select(.tag_name | test($re))][0].tag_name // empty
-      '
+      ')
       ;;
     any|*)
-      echo "$releases" | jq -r --arg re "$tag_regex" '
+      result=$(echo "$releases" | jq -r --arg re "$tag_regex" '
         [.[] | select(.tag_name | test($re))][0].tag_name // empty
-      '
+      ')
       ;;
   esac
+
+  if [[ -z "$result" && "${DEBUG:-false}" == "true" ]]; then
+    log_debug "No releases matched regex '$tag_regex'"
+    log_debug "Sample releases (first 5):"
+    echo "$releases" | jq -r '.[] | .tag_name' | head -5 | while read -r tag; do
+      log_debug "  - $tag (prerelease: $(echo "$releases" | jq -r --arg t "$tag" '.[] | select(.tag_name==$t) | .prerelease'))"
+    done
+  fi
+
+  echo "$result"
 }
 
 github_tags_filtered_versions() {
@@ -344,12 +299,36 @@ github_tags_filtered_versions() {
   local version_format="${4:-}"
   [[ -z "$repo" ]] && return 0
 
-  local tags_json
-  tags_json="$(fetch "https://api.github.com/repos/${repo}/tags?per_page=100")" || return 1
+  log_debug "github_tags_filtered_versions: repo=$repo, tag_regex=$tag_regex"
 
-  echo "$tags_json" | jq -r --arg re "$tag_regex" '
+  local tags_json
+  tags_json="$(fetch "https://api.github.com/repos/${repo}/tags?per_page=100")" || {
+    log_debug "Failed to fetch tags from GitHub API"
+    return 1
+  }
+
+  local tag_count
+  tag_count=$(echo "$tags_json" | jq -r '.[] | .name' | wc -l)
+  log_debug "Found $tag_count total tags"
+
+  local matching_tags
+  matching_tags=$(echo "$tags_json" | jq -r --arg re "$tag_regex" '
     .[] | .name | select(test($re))
-  ' | while IFS= read -r tag; do
+  ')
+  
+  local matching_count
+  matching_count=$(echo "$matching_tags" | grep -c . || echo "0")
+  log_debug "Found $matching_count tags matching regex '$tag_regex'"
+
+  if [[ "$matching_count" -eq 0 && "${DEBUG:-false}" == "true" ]]; then
+    log_debug "Sample tags from repo (first 5):"
+    echo "$tags_json" | jq -r '.[] | .name' | head -5 | while read -r tag; do
+      log_debug "  - $tag"
+    done
+  fi
+
+  echo "$matching_tags" | while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
     local raw
     raw="$(normalize_basic_tag_to_version "$tag")"
 
@@ -416,10 +395,18 @@ get_1password_linux_stable_version() {
 }
 
 get_lmstudio_version() {
+  log_debug "get_lmstudio_version: Fetching from lmstudio.ai/download"
+  
   local html
-  html="$(curl -sSL --max-time 5 "https://lmstudio.ai/download" 2>/dev/null)" || return 1
+  html="$(curl -sSL --max-time 5 "https://lmstudio.ai/download" 2>/dev/null)" || {
+    log_debug "Failed to fetch lmstudio.ai/download"
+    return 1
+  }
 
-  printf '%s' "$html" | python3 - <<'PY' 2>/dev/null || true
+  log_debug "HTML fetched, length: ${#html} bytes"
+
+  local result
+  result=$(printf '%s' "$html" | python3 - <<'PY' 2>/dev/null || true
 import re, sys
 html = sys.stdin.read()
 m = re.search(r'\\"linux\\":\{\\"x64\\":\{\\"version\\":\\"([0-9.]+)\\",\\"build\\":\\"([0-9]+)\\"', html)
@@ -427,7 +414,20 @@ if not m:
   sys.exit(2)
 print(f"{m.group(1)}.{m.group(2)}")
 PY
+)
+
+  if [[ -z "$result" && "${DEBUG:-false}" == "true" ]]; then
+    log_debug "Regex did not match. HTML snippet (first 500 chars):"
+    printf '%s' "$html" | head -c 500 | sed 's/^/  /' >&2
+    echo "" >&2
+  fi
+
+  echo "$result"
 }
+
+# ============================================================================
+# Main Version Detection Dispatcher
+# ============================================================================
 
 fetch_upstream_version_for_pkg() {
   local feeds_json="${1:-}"
@@ -473,6 +473,7 @@ fetch_upstream_version_for_pkg() {
       pick_max_version_list <<<"$versions"
       ;;
     vcs)
+      # VCS packages: optionally check repo for latest tag
       if [[ -n "$repo" ]]; then
         local tag
         tag="$(normalize_basic_tag_to_version "$(github_latest_release_tag "$repo" "stable" 2>/dev/null)")"
@@ -517,7 +518,9 @@ fetch_upstream_version_for_pkg() {
   esac
 }
 
-# -------- PKGBUILD helpers --------
+# ============================================================================
+# PKGBUILD Helpers
+# ============================================================================
 
 get_current_pkgver() {
   local pkgbuild_path="${1:-}"
@@ -536,49 +539,32 @@ is_vcs_pkg() {
   return 1
 }
 
-update_pkgbuild_version() {
-  local pkgbuild_path="${1:-}"
-  local new_version="${2:-}"
+# ============================================================================
+# Version Comparison & Status
+# ============================================================================
 
-  local clean_version
-  clean_version="$(trim "$new_version")"
-  clean_version="${clean_version//-/_}"
-
-  if [[ ! -w "$(dirname "$pkgbuild_path")" ]]; then
-    log_warning "Not writable: $(dirname "$pkgbuild_path")"
-    log_warning "Fix ownership/permissions, e.g.: sudo chown -R \$USER:\$USER '$(dirname "$pkgbuild_path")'"
-    return 1
+compare_versions() {
+  local current="${1:-}"
+  local upstream="${2:-}"
+  
+  # Use vercmp if available for accurate comparison
+  if command -v vercmp >/dev/null 2>&1; then
+    case "$(vercmp "$upstream" "$current")" in
+      -1) return 1 ;;  # upstream < current (local is newer)
+      0)  return 2 ;;  # upstream == current (up to date)
+      1)  return 0 ;;  # upstream > current (update available)
+    esac
+  else
+    # Fallback to string comparison
+    if [[ "$upstream" == "$current" ]]; then
+      return 2  # Equal
+    elif [[ "$upstream" > "$current" ]]; then
+      return 0  # Update available
+    else
+      return 1  # Local newer
+    fi
   fi
-
-  if ! cp "$pkgbuild_path" "${pkgbuild_path}.backup" 2>/dev/null; then
-    log_warning "Failed to write backup: ${pkgbuild_path}.backup"
-    return 1
-  fi
-
-  if ! sed -i -E "s/^pkgver=.*/pkgver='${clean_version//&/\\&}'/" "$pkgbuild_path"; then
-    log_warning "Failed to update pkgver in $pkgbuild_path"
-    return 1
-  fi
-
-  if ! sed -i -E "s/^pkgrel=.*/pkgrel=1/" "$pkgbuild_path"; then
-    log_warning "Failed to update pkgrel in $pkgbuild_path"
-    return 1
-  fi
-
-  return 0
 }
-
-update_checksums() {
-  local pkg_dir="${1:-}"
-  ( cd "$pkg_dir" && updpkgsums ) >/dev/null 2>&1
-}
-
-build_package() {
-  local pkg_dir="${1:-}"
-  ( cd "$pkg_dir" && makepkg -scf --noconfirm --needed )
-}
-
-# -------- reporting / comparison --------
 
 status_for() {
   local current="${1:-}"
@@ -598,12 +584,12 @@ status_for() {
   fi
 
   if [[ "$is_vcs" == "true" ]]; then
-    echo "SKIP"
+    echo "VCS"
     return 0
   fi
 
   if [[ -z "$upstream" ]]; then
-    echo "n/a"
+    echo "UNKNOWN"
     return 0
   fi
 
@@ -612,309 +598,307 @@ status_for() {
     return 0
   fi
 
-  if command -v vercmp >/dev/null 2>&1; then
-    local cmp
-    cmp="$(vercmp "$upstream" "$current")"
-    if [[ "$cmp" -gt 0 ]]; then
-      echo "UPDATE"
-    else
-      echo "OK"
-    fi
-    return 0
-  fi
-
-  if [[ "$current" == "$upstream" ]]; then
-    echo "OK"
-  else
-    echo "UPDATE"
-  fi
+  # Call compare_versions once and capture return code
+  compare_versions "$current" "$upstream"
+  local cmp_result=$?
+  
+  case $cmp_result in
+    0)  echo "UPDATE" ;;  # Update available
+    2)  echo "OK" ;;      # Up to date
+    1)  echo "NEWER" ;;   # Local is newer
+    *)  echo "UNKNOWN" ;; # Error
+  esac
 }
+
+# ============================================================================
+# Output Formatting
+# ============================================================================
 
 print_table_header() {
-  printf "\n%-28s %-18s %-18s %-10s\n" "PACKAGE" "CURRENT" "UPSTREAM" "STATUS"
-  printf "%-28s %-18s %-18s %-10s\n" \
-    "----------------------------" "------------------" "------------------" "----------"
+  printf "\n%-30s %-18s %-18s %-10s\n" "PACKAGE" "CURRENT" "UPSTREAM" "STATUS"
+  printf "%-30s %-18s %-18s %-10s\n" \
+    "------------------------------" "------------------" "------------------" "----------"
 }
 
-# -------- CLI parsing --------
+# ============================================================================
+# CLI Options
+# ============================================================================
 
 declare FEEDS_JSON="$DEFAULT_FEEDS_JSON"
-declare DRY_RUN="false"
-declare NO_BUILD="false"
-declare BUILD_ONLY="false"
-declare CLEAN_BUILD="false"
-declare STRICT="false"
-declare LIST_ONLY="false"
+declare LIST_OUTDATED="false"
+declare OUTPUT_JSON="false"
 declare DEBUG="false"
-declare -a SELECTED=()
+declare -a SPECIFIC_PACKAGES=()
 
 show_usage() {
   cat <<EOF
-Usage: $0 [OPTIONS] [PACKAGES...]
+Usage: $0 [OPTIONS] [packages...]
 
-Update/build AUR-style PKGBUILDs using feeds.json as the source of truth.
+Check which packages need updates (version detection only, no building).
 
-By default, when run in a terminal, the script will prompt per package before
-applying updates (with an option to accept all remaining prompts).
+This script does NOT build packages. Use build-packages.sh for building.
 
 OPTIONS:
   --feeds <path>        Path to feeds.json (default: $DEFAULT_FEEDS_JSON)
+  --list-outdated       Only output package names needing updates
+  --json                Output JSON for scripting
+  --debug               Extra diagnostics
+  -h, --help            Show this help
 
-  --dry-run             Print CURRENT vs UPSTREAM and exit (no changes)
-  --list                List packages from feeds.json and exit
-
-  --no-build            Update PKGBUILD/updpkgsums but skip makepkg
-  --build-only          Only build; do not version-bump
-  --clean               Remove src/pkg/*.pkg.tar.* before building
-
-  --strict              Exit non-zero if feeds.json entries are missing directories/PKGBUILDs
-  --debug               Extra diagnostics (shows feed types, repos, API calls)
-
-  --no-prompt           Non-interactive mode (never ask questions)
-  -y, --yes             Assume "yes" for all prompts (equivalent to non-interactive)
-
-PROMPTS:
-  When prompting is enabled, each package update/build prompt accepts:
-    y = yes (default), n = no (skip), a = yes to all remaining, q = quit
+If packages are specified, only those packages are checked.
+Otherwise, all packages in feeds.json are checked.
 
 EXAMPLES:
-  $0 --dry-run
-  $0 --dry-run --strict
-  $0 github-cli ktailctl
-  $0 --no-build
-  $0 --build-only --clean
-  $0 -y
-  $0 --no-prompt
+  # Check all packages
+  $0
 
+  # Check specific packages
+  $0 ktailctl ollama
+
+  # Get list for piping to build-packages.sh
+  $0 --list-outdated | xargs ./build-packages.sh
+
+  # JSON output for scripting
+  $0 --json
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --feeds)
-      FEEDS_JSON="$2"
-      shift 2
-      ;;
-    --dry-run) DRY_RUN="true"; shift ;;
-    --no-build) NO_BUILD="true"; shift ;;
-    --build-only) BUILD_ONLY="true"; shift ;;
-    --clean) CLEAN_BUILD="true"; shift ;;
-    --strict) STRICT="true"; shift ;;
-    --list) LIST_ONLY="true"; shift ;;
-    --debug) DEBUG="true"; shift ;;
-    --no-prompt) INTERACTIVE="false"; shift ;;
-    -y|--yes) YES_ALL="true"; INTERACTIVE="false"; shift ;;
-    -h|--help) show_usage; exit 0 ;;
-    -*)
-      log_error "Unknown option: $1"
-      show_usage
-      exit 1
-      ;;
-    *)
-      SELECTED+=("$1")
-      shift
-      ;;
-  esac
-done
-
-if [[ ! -t 0 || ! -t 1 ]]; then
-  INTERACTIVE="false"
-fi
-
-
-main() {
-  [[ ! -f "$FEEDS_JSON" ]] && log_error "feeds.json not found: $FEEDS_JSON" && exit 1
-
-  if [[ "$DRY_RUN" != "true" ]]; then
-    check_deps
-  else
-    # still need jq/curl for dry-run
-    check_deps
-  fi
-
-  local schema_version
-  schema_version="$(feeds_json_get_schema_version "$FEEDS_JSON")"
-  log_debug "Schema version: $schema_version"
-
-  if [[ "$LIST_ONLY" == "true" ]]; then
-    feeds_json_list_packages "$FEEDS_JSON" | sort
-    exit 0
-  fi
-
-  local -a pkgs=()
-  if [[ ${#SELECTED[@]} -gt 0 ]]; then
-    pkgs=("${SELECTED[@]}")
-  else
-    while IFS= read -r p; do
-      [[ -n "$p" ]] && pkgs+=("$p")
-    done < <(feeds_json_list_packages "$FEEDS_JSON")
-  fi
-
-  if [[ ${#pkgs[@]} -eq 0 ]]; then
-    log_error "No packages found in feeds.json."
-    exit 1
-  fi
-
-  if [[ "$DEBUG" == "true" ]]; then
-    log_info "Project root: $PROJECT_ROOT"
-    log_info "Feeds: $FEEDS_JSON (schemaVersion=$schema_version)"
-    log_info "Packages to process (${#pkgs[@]}): ${pkgs[*]}"
-  fi
-
-  # Validate: every feeds entry must exist on disk
-  local -a missing_dirs=()
-  local -a missing_pkgbuilds=()
-
-  local pkg
-  for pkg in "${pkgs[@]}"; do
-    if ! feeds_json_has_pkg "$FEEDS_JSON" "$pkg"; then
-      log_error "Package '$pkg' not present in feeds.json"
-      continue
-    fi
-
-    local dir="$PROJECT_ROOT/$pkg"
-    local pkgb="$dir/PKGBUILD"
-    [[ ! -d "$dir" ]] && missing_dirs+=("$pkg")
-    [[ -d "$dir" && ! -f "$pkgb" ]] && missing_pkgbuilds+=("$pkg")
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --feeds)
+        FEEDS_JSON="$2"
+        shift 2
+        ;;
+      --list-outdated) LIST_OUTDATED="true"; shift ;;
+      --json) OUTPUT_JSON="true"; shift ;;
+      --debug) DEBUG="true"; shift ;;
+      --dry-run) shift ;;  # Accept but ignore (for compatibility)
+      -h|--help) show_usage; exit 0 ;;
+      -*)
+        log_error "Unknown option: $1"
+        show_usage
+        exit 1
+        ;;
+      *)
+        SPECIFIC_PACKAGES+=("$1")
+        shift
+        ;;
+    esac
   done
+}
 
-  if [[ ${#missing_dirs[@]} -gt 0 ]]; then
-    log_warning "Missing package directories: ${missing_dirs[*]}"
-  fi
-  if [[ ${#missing_pkgbuilds[@]} -gt 0 ]]; then
-    log_warning "Missing PKGBUILD files: ${missing_pkgbuilds[*]}"
-  fi
-  if [[ "$STRICT" == "true" && ( ${#missing_dirs[@]} -gt 0 || ${#missing_pkgbuilds[@]} -gt 0 ) ]]; then
-    log_error "--strict set; failing due to missing dirs/PKGBUILDs."
-    exit 1
-  fi
+# ============================================================================
+# Package Checking
+# ============================================================================
 
-  if [[ "$DRY_RUN" != "true" && "$NO_BUILD" != "true" ]]; then
-    # Ask once up front so makepkg/pacman won't repeatedly prompt.
-    log_info "Authenticating sudo once for dependency installs during builds..."
-    sudo_keepalive_start || { log_error "sudo authentication failed"; exit 1; }
-  fi
-
-  print_table_header
-
-  local -a failed=()
-  local updated=0
-
-  for pkg in "${pkgs[@]}"; do
-    local has_feed="false"
-    feeds_json_has_pkg "$FEEDS_JSON" "$pkg" && has_feed="true"
-
-    local type
-    type="$(feeds_json_get_field "$FEEDS_JSON" "$pkg" "type")"
-    local is_manual="false"
-    [[ "$type" == "manual" ]] && is_manual="true"
-
-    local dir="$PROJECT_ROOT/$pkg"
-    local pkgb="$dir/PKGBUILD"
-
-    local current upstream status
-    current="$(get_current_pkgver "$pkgb")"
-    upstream=""
-
-    if [[ "$has_feed" == "true" ]]; then
-      upstream="$(trim "$(fetch_upstream_version_for_pkg "$FEEDS_JSON" "$pkg")")"
+check_single_package() {
+  local pkg="$1"
+  local pkg_dir="$PROJECT_ROOT/$pkg"
+  local pkgbuild="$pkg_dir/PKGBUILD"
+  
+  if [[ ! -d "$pkg_dir" ]]; then
+    if [[ "$LIST_OUTDATED" != "true" && "$OUTPUT_JSON" != "true" ]]; then
+      log_error "$pkg: Package directory not found"
     fi
-
-    local is_vcs="false"
-    if is_vcs_pkg "$FEEDS_JSON" "$pkg"; then
-      is_vcs="true"
+    return 1
+  fi
+  
+  if [[ ! -f "$pkgbuild" ]]; then
+    if [[ "$LIST_OUTDATED" != "true" && "$OUTPUT_JSON" != "true" ]]; then
+      log_error "$pkg: PKGBUILD not found"
     fi
-
-    status="$(status_for "$current" "$upstream" "$has_feed" "$is_vcs" "$is_manual")"
-
-    # Render upstream cell with VCS context
-    local upstream_cell="$upstream"
+    return 1
+  fi
+  
+  # Get feed info
+  local has_feed="false"
+  feeds_json_has_pkg "$FEEDS_JSON" "$pkg" && has_feed="true"
+  
+  if [[ "$has_feed" != "true" ]]; then
+    if [[ "$LIST_OUTDATED" != "true" && "$OUTPUT_JSON" != "true" ]]; then
+      log_warning "$pkg: Not found in feeds.json"
+    fi
+    return 1
+  fi
+  
+  local type
+  type="$(feeds_json_get_field "$FEEDS_JSON" "$pkg" "type")"
+  
+  local is_manual="false"
+  [[ "$type" == "manual" ]] && is_manual="true"
+  
+  local is_vcs="false"
+  is_vcs_pkg "$FEEDS_JSON" "$pkg" && is_vcs="true"
+  
+  # Get versions
+  local current upstream
+  current="$(get_current_pkgver "$pkgbuild")"
+  upstream=""
+  
+  if [[ "$has_feed" == "true" ]]; then
+    upstream="$(trim "$(fetch_upstream_version_for_pkg "$FEEDS_JSON" "$pkg")")"
+    
+    # Debug: If we couldn't get upstream version, explain why
+    if [[ -z "$upstream" && "$is_manual" != "true" && "${DEBUG:-false}" == "true" ]]; then
+      log_debug "$pkg: Failed to detect remote version"
+      log_debug "  Type: $type"
+      log_debug "  This could be due to:"
+      log_debug "    - Network/API issue"
+      log_debug "    - GitHub rate limiting (set GITHUB_TOKEN)"
+      log_debug "    - Regex not matching tag format"
+      log_debug "    - API response format changed"
+      log_debug "  Try: DEBUG=true $0 $pkg"
+    fi
+  fi
+  
+  # Determine status
+  local status
+  status="$(status_for "$current" "$upstream" "$has_feed" "$is_vcs" "$is_manual")"
+  
+  # Output based on mode
+  if [[ "$LIST_OUTDATED" == "true" ]]; then
+    if [[ "$status" == "UPDATE" ]]; then
+      echo "$pkg"
+    fi
+  elif [[ "$OUTPUT_JSON" == "true" ]]; then
+    jq -n \
+      --arg pkg "$pkg" \
+      --arg current "${current:-}" \
+      --arg upstream "${upstream:-}" \
+      --arg status "$status" \
+      '{
+        package: $pkg,
+        current_version: $current,
+        upstream_version: $upstream,
+        status: $status
+      }'
+  else
+    # Human-readable output
+    local upstream_display="$upstream"
     if [[ "$is_manual" == "true" ]]; then
-      upstream_cell="n/a"
+      upstream_display="n/a"
     elif [[ "$is_vcs" == "true" ]]; then
       if [[ -n "$upstream" ]]; then
-        upstream_cell="${upstream} (stable)"
+        upstream_display="${upstream} (stable)"
       else
-        upstream_cell="VCS"
+        upstream_display="VCS"
       fi
-    elif [[ -z "$upstream_cell" ]]; then
-      upstream_cell="n/a"
+    elif [[ -z "$upstream_display" ]]; then
+      upstream_display="n/a"
     fi
-
-    printf "%-28s %-18s %-18s %-10s\n" \
-      "$pkg" \
-      "${current:-n/a}" \
-      "$upstream_cell" \
-      "$status"
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-      continue
-    fi
-
-    # Actual update/build logic
-    if [[ ! -d "$dir" || ! -f "$pkgb" ]]; then
-      log_warning "Skipping $pkg (missing directory or PKGBUILD: $dir)"
-      # Only mark as failure if --strict is enabled
-      if [[ "$STRICT" == "true" ]]; then
-        failed+=("$pkg")
-      fi
-      continue
-    fi
-
-    if [[ "$BUILD_ONLY" == "true" ]]; then
-      if [[ "$CLEAN_BUILD" == "true" ]]; then
-        rm -rf "$dir/src" "$dir/pkg" "$dir"/*.pkg.tar.* >"$dir/.update-pkg.build.log" 2>&1 || true
-      fi
-      if ! build_package "$dir" >"$dir/.update-pkg.build.log" 2>&1; then
-        log_error "Build failed for $pkg (see $dir/.update-pkg.build.log)"
-        failed+=("$pkg")
-      fi
-      continue
-    fi
-
-    if [[ "$status" == "UPDATE" && "$is_vcs" != "true" && "$is_manual" != "true" && -n "$upstream" ]]; then
-      if confirm_action "$pkg" "$current" "$upstream" "update"; then
-        update_pkgbuild_version "$pkgb" "$upstream" || { failed+=("$pkg"); continue; }
-        update_checksums "$dir" || true
-        ((updated++))
-      else
-        log_info "Skipped update for $pkg"
-        continue
-      fi
-    fi
-
-    if [[ "$NO_BUILD" != "true" ]]; then
-      # Only build if we updated PKGBUILD in this run OR user is in --build-only mode.
-      # Your current code builds everything; if you want that, keep it. If not, gate it.
-      if [[ "$status" == "UPDATE" ]]; then
-        if confirm_action "$pkg" "$current" "$upstream" "build"; then
-          if [[ "$CLEAN_BUILD" == "true" ]]; then
-            rm -rf "$dir/src" "$dir/pkg" "$dir"/*.pkg.tar.* >"$dir/.update-pkg.build.log" 2>&1 || true
-          fi
-          if ! build_package "$dir" >"$dir/.update-pkg.build.log" 2>&1; then
-            log_error "Build failed for $pkg (see $dir/.update-pkg.build.log)"
-            failed+=("$pkg")
-          fi
-        else
-          log_info "Skipped build for $pkg"
+    
+    case "$status" in
+      UPDATE)
+        log_info "$pkg: ${current:-n/a} → $upstream_display (update available)"
+        return 0
+        ;;
+      OK)
+        log_success "$pkg: up-to-date ($current)"
+        return 1
+        ;;
+      NEWER)
+        log_warning "$pkg: local version ($current) is newer than remote ($upstream)"
+        return 1
+        ;;
+      MANUAL)
+        log_info "$pkg: Manual package, skipping version check"
+        return 1
+        ;;
+      VCS)
+        if [[ -n "$upstream" ]]; then
+          log_info "$pkg: VCS package (stable: $upstream)"
         fi
-      fi
+        return 1
+        ;;
+      UNKNOWN)
+        log_warning "$pkg: Could not detect remote version"
+        return 1
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  fi
+}
+
+check_all_packages() {
+  if [[ ! -f "$FEEDS_JSON" ]]; then
+    log_error "feeds.json not found: $FEEDS_JSON"
+    return 1
+  fi
+  
+  local -a all_packages=()
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] && all_packages+=("$pkg")
+  done < <(feeds_json_list_packages "$FEEDS_JSON" 2>/dev/null | sort -u)
+  
+  if [[ ${#all_packages[@]} -eq 0 ]]; then
+    log_error "No packages found in feeds.json"
+    return 1
+  fi
+  
+  if [[ "$LIST_OUTDATED" != "true" && "$OUTPUT_JSON" != "true" ]]; then
+    print_table_header
+  fi
+  
+  local pkg=""
+  local outdated_count=0
+  
+  for pkg in "${all_packages[@]}"; do
+    if check_single_package "$pkg"; then
+      ((outdated_count++))
     fi
   done
-
-  if [[ "$DRY_RUN" == "true" ]]; then
-    echo
-    log_success "Dry-run complete."
-    return 0
+  
+  if [[ "$LIST_OUTDATED" != "true" && "$OUTPUT_JSON" != "true" ]]; then
+    echo ""
+    if [[ $outdated_count -eq 0 ]]; then
+      log_success "All packages are up-to-date"
+    else
+      log_info "$outdated_count package(s) need updates"
+      log_info "Build with: ./build-packages.sh --all"
+    fi
   fi
+  
+  return 0
+}
 
-  echo
-  log_info "Updated PKGBUILDs: $updated"
-  if [[ ${#failed[@]} -gt 0 ]]; then
-    log_error "Failed: ${failed[*]}"
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+  parse_args "$@"
+  
+  # Check dependencies
+  local -a missing=()
+  command -v jq >/dev/null 2>&1 || missing+=("jq")
+  command -v curl >/dev/null 2>&1 || missing+=("curl")
+  command -v python3 >/dev/null 2>&1 || missing+=("python")
+  command -v xmllint >/dev/null 2>&1 || missing+=("libxml2")
+  
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log_error "Missing dependencies: ${missing[*]}"
+    log_info "Install with: sudo pacman -S ${missing[*]}"
     exit 1
   fi
-  log_success "All done."
+  
+  if [[ ! -f "$FEEDS_JSON" ]]; then
+    log_error "feeds.json not found: $FEEDS_JSON"
+    exit 1
+  fi
+  
+  if [[ ${#SPECIFIC_PACKAGES[@]} -gt 0 ]]; then
+    # Check specific packages
+    local pkg=""
+    for pkg in "${SPECIFIC_PACKAGES[@]}"; do
+      check_single_package "$pkg"
+    done
+  else
+    # Check all packages
+    check_all_packages
+  fi
 }
 
 main "$@"

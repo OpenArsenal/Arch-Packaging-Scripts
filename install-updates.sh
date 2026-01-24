@@ -1,484 +1,296 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# install-updates.sh
+# install-updates.sh - SIMPLIFIED: Install from staged artifacts or repo
 #
-# Cross-compare installed packages with local PKGBUILDs.
-# If local PKGBUILD version is newer than installed:
-#   - install already-built artifact if present
-#   - otherwise build it, then install
-# Failures warn and continue.
+# OLD BEHAVIOR: Built packages AND installed them (too much)
+# NEW BEHAVIOR: Only installs pre-built packages (one job)
+#
+# This script assumes packages are ALREADY built by build-packages.sh
+# and staged in ~/.cache/pkg-mgmt/staging/ OR in the local repo
 #
 # Examples:
-#   ./install-updates.sh --root "$HOME/Projects/Packages"
-#   ./install-updates.sh --root "$HOME/Projects/Packages" --dry-run
-#   ./install-updates.sh --root "$HOME/Projects/Packages" -y
-#   ./install-updates.sh --root "$HOME/Projects/Packages" ollama ktailctl
+#   ./install-updates.sh --from-staging      # Install staged artifacts
+#   ./install-updates.sh --from-repo         # Install from custom repo
+#   ./install-updates.sh --auto              # Auto-detect best source
 
-declare -r RED='\033[0;31m'
-declare -r GREEN='\033[0;32m'
-declare -r YELLOW='\033[1;33m'
-declare -r BLUE='\033[0;34m'
-declare -r NC='\033[0m'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
 
-log_info() { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
-log_ok() { echo -e "${GREEN}[OK]${NC} $*" >&2; }
-log_warn() { echo -e "${YELLOW}[WARNING]${NC} $*" >&2; }
-log_err() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-log_debug() { [[ "${DEBUG:-false}" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2; }
+# ============================================================================
+# Configuration
+# ============================================================================
 
-if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  log_err "Do not run this script as root."
-  exit 1
-fi
+declare -r STAGING_DIR="${STAGING_DIR:-$HOME/.cache/pkg-mgmt/staging}"
 
-# ----- CLI flags -----
+# ============================================================================
+# Options
+# ============================================================================
 
-declare ROOT="${ROOT:-"$PWD"}"
+declare INSTALL_FROM="auto"  # auto | staging | repo
 declare DRY_RUN="false"
-declare DEBUG="false"
-declare CLEAN="false"
-declare INCLUDE_VCS="false"
-
-declare INTERACTIVE="true"
-declare YES_ALL="false"
+declare SPECIFIC_PACKAGES=()
 
 show_usage() {
   cat <<EOF
-Usage: $0 [OPTIONS] [DIR_NAMES...]
+Usage: $0 [OPTIONS] [packages...]
 
-Scans local PKGBUILDs under --root, intersects with installed packages,
-and updates installed packages if local version is newer.
+Install pre-built packages from staging area or local repository.
+
+NOTE: This script does NOT build packages.
+      Use build-packages.sh first, then install.
 
 OPTIONS:
-  --root <path>        Root containing package dirs (default: PWD)
-  --dry-run            Print what would happen; do nothing
-  --clean              Remove src/pkg/*.pkg.tar.* before building
-  --include-vcs        Include *-git/*-hg/*-svn packages (default: skipped)
-  --debug              Extra logs
-  --no-prompt          Never prompt (non-interactive)
-  -y, --yes            Assume yes for all prompts (also non-interactive)
-  -h, --help           Show help
+  --from-staging      Install from staging area ($STAGING_DIR)
+  --from-repo         Install from local repository (pacman -S custom/pkg)
+  --auto              Auto-detect (staging first, then repo) [default]
+  --dry-run           Show what would be installed
+  -h, --help          Show this help
 
-If DIR_NAMES are provided, only those directories are scanned (still only updates if installed).
+WORKFLOW:
+  1. build-packages.sh ktailctl ollama    # Build packages
+  2. ./install-updates.sh                 # Install built packages
+
+  OR:
+
+  1. build-packages.sh --all              # Build everything
+  2. repo-mgmt.sh add staging/*.pkg.tar.zst   # Add to repo
+  3. sudo pacman -Syu                     # Install from repo
+
+EXAMPLES:
+  # Install from staging
+  $0 --from-staging
+
+  # Install specific packages from repo
+  $0 --from-repo ktailctl ollama
+
+  # Auto-detect best source
+  $0
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --root) ROOT="${2:?missing path after --root}"; shift 2 ;;
-    --dry-run) DRY_RUN="true"; shift ;;
-    --clean) CLEAN="true"; shift ;;
-    --include-vcs) INCLUDE_VCS="true"; shift ;;
-    --debug) DEBUG="true"; shift ;;
-    --no-prompt) INTERACTIVE="false"; shift ;;
-    -y|--yes) YES_ALL="true"; INTERACTIVE="false"; shift ;;
-    -h|--help) show_usage; exit 0 ;;
-    --) shift; break ;;
-    -*) log_err "Unknown option: $1"; show_usage; exit 1 ;;
-    *) break ;;
-  esac
-done
+# ============================================================================
+# Package Discovery
+# ============================================================================
 
-if [[ ! -t 0 || ! -t 1 ]]; then
-  INTERACTIVE="false"
-fi
-
-declare -a SELECTED_DIRS=()
-if [[ $# -gt 0 ]]; then
-  SELECTED_DIRS=("$@")
-fi
-
-# ----- prompt helpers (same vibe as update-pkg.sh) -----
-
-read_choice_tty() {
-  local out_var="$1"
-  local prompt="$2"
-  local choice=""
-  printf "%s" "$prompt" >/dev/tty
-  IFS= read -r choice </dev/tty || choice=""
-  printf -v "$out_var" "%s" "$choice"
+get_installed_packages() {
+  pacman -Qq 2>/dev/null
 }
 
-confirm_action() {
-  local label="$1"   # e.g. "ollama: install update"
-  local from="$2"    # installed version
-  local to="$3"      # local version
-
-  if [[ "$INTERACTIVE" != "true" ]]; then
+find_staged_packages() {
+  if [[ ! -d "$STAGING_DIR" ]]; then
     return 0
   fi
-  if [[ "$YES_ALL" == "true" ]]; then
+  
+  find "$STAGING_DIR" -maxdepth 1 -name "*.pkg.tar.*" -type f 2>/dev/null
+}
+
+extract_pkgname_from_file() {
+  local file="$1"
+  local basename="$(basename "$file")"
+  
+  # Extract pkgname from filename: pkgname-version-arch.pkg.tar.zst
+  # This is fragile but works for most cases
+  echo "$basename" | sed -E 's/-[0-9].+$//'
+}
+
+get_repo_packages() {
+  if [[ ! -f "$REPO_DB" ]]; then
     return 0
   fi
+  
+  bsdtar -xOf "$REPO_DB" 2>/dev/null | awk '/^%NAME%$/ { getline; print }'
+}
 
-  local ans=""
-  while true; do
-    read_choice_tty ans \
-      "[PROMPT] ${label} (${from} -> ${to})? [y]es/[n]o/[a]ll/[q]uit: "
-    case "${ans,,}" in
-      y|"") return 0 ;;
-      n) return 1 ;;
-      a) YES_ALL="true"; return 0 ;;
-      q) log_err "Aborted by user."; exit 1 ;;
-      *) ;;
+# ============================================================================
+# Installation
+# ============================================================================
+
+install_from_staging() {
+  local -a pkg_files=()
+  
+  if [[ ${#SPECIFIC_PACKAGES[@]} -gt 0 ]]; then
+    # Install specific packages
+    local pkg=""
+    for pkg in "${SPECIFIC_PACKAGES[@]}"; do
+      local -a matches=()
+      while IFS= read -r f; do
+        [[ -n "$f" ]] && matches+=("$f")
+      done < <(find "$STAGING_DIR" -maxdepth 1 -name "${pkg}-*.pkg.tar.*" -type f 2>/dev/null)
+      
+      if [[ ${#matches[@]} -eq 0 ]]; then
+        log_error "No staged package found for: $pkg"
+        continue
+      fi
+      
+      # Get newest if multiple matches
+      local newest=""
+      newest=$(ls -t "${matches[@]}" | head -1)
+      pkg_files+=("$newest")
+    done
+  else
+    # Install all staged packages
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && pkg_files+=("$f")
+    done < <(find_staged_packages)
+  fi
+  
+  if [[ ${#pkg_files[@]} -eq 0 ]]; then
+    log_warning "No packages found in staging area"
+    return 1
+  fi
+  
+  log_info "Installing ${#pkg_files[@]} package(s) from staging..."
+  
+  for f in "${pkg_files[@]}"; do
+    log_info "  - $(basename "$f")"
+  done
+  
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "DRY-RUN: Would run: sudo pacman -U ${pkg_files[*]}"
+    return 0
+  fi
+  
+  # Use pacman -U to install from files
+  echo ""
+  if ! sudo pacman -U --needed "${pkg_files[@]}"; then
+    log_error "Installation failed"
+    return 1
+  fi
+  
+  log_success "Installation complete"
+  
+  # Optionally clean staging after successful install
+  read -p "Remove installed packages from staging? [y/N]: " -n 1 -r
+  echo ""
+  if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+    for f in "${pkg_files[@]}"; do
+      rm -f "$f"
+      log_info "Removed: $(basename "$f")"
+    done
+  fi
+}
+
+install_from_repo() {
+  local -a pkg_names=()
+  
+  if [[ ${#SPECIFIC_PACKAGES[@]} -gt 0 ]]; then
+    pkg_names=("${SPECIFIC_PACKAGES[@]}")
+  else
+    # Get all packages from repo that are also installed
+    local -a installed=()
+    while IFS= read -r pkg; do
+      [[ -n "$pkg" ]] && installed+=("$pkg")
+    done < <(get_installed_packages)
+    
+    local -a repo_pkgs=()
+    while IFS= read -r pkg; do
+      [[ -n "$pkg" ]] && repo_pkgs+=("$pkg")
+    done < <(get_repo_packages)
+    
+    # Intersect: packages in repo AND installed
+    for pkg in "${repo_pkgs[@]}"; do
+      if [[ " ${installed[*]} " =~ " ${pkg} " ]]; then
+        pkg_names+=("$pkg")
+      fi
+    done
+  fi
+  
+  if [[ ${#pkg_names[@]} -eq 0 ]]; then
+    log_warning "No packages to install from repository"
+    return 1
+  fi
+  
+  log_info "Installing ${#pkg_names[@]} package(s) from repository..."
+  
+  # Prefix with repo name for explicit repo selection
+  local -a repo_refs=()
+  for pkg in "${pkg_names[@]}"; do
+    repo_refs+=("$REPO_NAME/$pkg")
+    log_info "  - $pkg"
+  done
+  
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "DRY-RUN: Would run: sudo pacman -S ${repo_refs[*]}"
+    return 0
+  fi
+  
+  # Use pacman -S with repo prefix
+  echo ""
+  if ! sudo pacman -S --needed "${repo_refs[@]}"; then
+    log_error "Installation failed"
+    return 1
+  fi
+  
+  log_success "Installation complete"
+}
+
+install_auto() {
+  # Try staging first, then fall back to repo
+  
+  log_info "Auto-detecting installation source..."
+  
+  local -a staged=()
+  while IFS= read -r f; do
+    [[ -n "$f" ]] && staged+=("$f")
+  done < <(find_staged_packages)
+  
+  if [[ ${#staged[@]} -gt 0 ]]; then
+    log_info "Found ${#staged[@]} package(s) in staging"
+    install_from_staging
+  elif [[ -f "$REPO_DB" ]]; then
+    log_info "No staged packages, using repository"
+    install_from_repo
+  else
+    log_error "No installation source found"
+    log_info "Build packages first: build-packages.sh --all"
+    return 1
+  fi
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from-staging) INSTALL_FROM="staging"; shift ;;
+      --from-repo) INSTALL_FROM="repo"; shift ;;
+      --auto) INSTALL_FROM="auto"; shift ;;
+      --dry-run) DRY_RUN="true"; shift ;;
+      -h|--help) show_usage; exit 0 ;;
+      -*)
+        log_error "Unknown option: $1"
+        show_usage
+        exit 1
+        ;;
+      *)
+        SPECIFIC_PACKAGES+=("$1")
+        shift
+        ;;
     esac
   done
 }
-
-# ----- deps -----
-
-check_deps() {
-  local -a missing=()
-  command -v pacman >/dev/null 2>&1 || missing+=("pacman")
-  command -v makepkg >/dev/null 2>&1 || missing+=("base-devel")
-  command -v sudo >/dev/null 2>&1 || missing+=("sudo")
-  command -v vercmp >/dev/null 2>&1 || true
-
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    log_err "Missing dependencies: ${missing[*]}"
-    exit 1
-  fi
-}
-
-# ----- core helpers -----
-
-is_vcs_name() {
-  local name="${1:-}"
-  [[ "$name" =~ -(git|hg|svn|bzr)$ ]]
-}
-
-is_installed() {
-  local pkg="${1:?pkg required}"
-  pacman -Qq "$pkg" >/dev/null 2>&1
-}
-
-installed_version() {
-  local pkg="${1:?pkg required}"
-  pacman -Q "$pkg" 2>/dev/null | awk '{print $2}'
-}
-
-vercmp_gt() {
-  # returns 0 if a > b
-  local a="$1"
-  local b="$2"
-
-  if command -v vercmp >/dev/null 2>&1; then
-    [[ "$(vercmp "$a" "$b")" -gt 0 ]]
-    return
-  fi
-
-  # Fallback: string compare (less accurate)
-  [[ "$a" != "$b" ]] && [[ "$a" > "$b" ]]
-}
-
-vercmp_eq() {
-  local a="$1"
-  local b="$2"
-
-  if command -v vercmp >/dev/null 2>&1; then
-    [[ "$(vercmp "$a" "$b")" -eq 0 ]]
-    return
-  fi
-  [[ "$a" == "$b" ]]
-}
-
-pkgbuild_meta() {
-  # Prints:
-  #   <epoch> <pkgver> <pkgrel>
-  # Returns non-zero on failure.
-  #
-  # Uses makepkg --printsrcinfo so it correctly handles arrays, etc.
-  makepkg --printsrcinfo 2>/dev/null | awk '
-    $1=="epoch"  && $2=="=" { epoch=$3 }
-    $1=="pkgver" && $2=="=" { pkgver=$3 }
-    $1=="pkgrel" && $2=="=" { pkgrel=$3 }
-    END {
-      if (pkgver=="" || pkgrel=="") exit 2
-      if (epoch=="") epoch="0"
-      print epoch, pkgver, pkgrel
-    }
-  '
-}
-
-pkgbuild_pkgnames() {
-  # Prints one pkgname per line (may be multiple).
-  makepkg --printsrcinfo 2>/dev/null | awk '
-    $1=="pkgname" && $2=="=" { print $3 }
-  ' | sed '/^$/d' | awk '!seen[$0]++'
-}
-
-local_version_string() {
-  local epoch="$1"
-  local pkgver="$2"
-  local pkgrel="$3"
-  if [[ -n "$epoch" && "$epoch" != "0" ]]; then
-    printf "%s:%s-%s" "$epoch" "$pkgver" "$pkgrel"
-  else
-    printf "%s-%s" "$pkgver" "$pkgrel"
-  fi
-}
-
-artifact_paths_for_installed_pkgs() {
-  # Given: epoch pkgver pkgrel, plus a list of package names on stdin (installed ones),
-  # emits matching built artifact paths from makepkg --packagelist.
-  #
-  # Matches files like:
-  #   /path/pkgname-pkgver-pkgrel-arch.pkg.tar.zst
-  local pkgver="$1"
-  local pkgrel="$2"
-
-  local -a wanted=()
-  local line=""
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && wanted+=("$line")
-  done
-
-  local -a all_files=()
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && all_files+=("$line")
-  done < <(makepkg --packagelist 2>/dev/null || true)
-
-  # If packagelist fails, emit nothing.
-  [[ ${#all_files[@]} -eq 0 ]] && return 0
-
-  local f=""
-  local w=""
-  for w in "${wanted[@]}"; do
-    # Use a deterministic pattern boundary: "-${pkgver}-${pkgrel}-"
-    local needle="-${pkgver}-${pkgrel}-"
-    for f in "${all_files[@]}"; do
-      local base="${f##*/}"
-      if [[ "$base" == "$w"*"$needle"*".pkg.tar."* ]]; then
-        printf "%s\n" "$f"
-      fi
-    done
-  done
-}
-
-all_files_exist() {
-  local -a files=("$@")
-  local f=""
-  for f in "${files[@]}"; do
-    [[ -f "$f" ]] || return 1
-  done
-  return 0
-}
-
-install_files() {
-  # Install built package files.
-  local -a files=("$@")
-  [[ ${#files[@]} -eq 0 ]] && return 1
-
-  log_debug "Installing via pacman -U: ${files[*]}"
-  sudo pacman -U --noconfirm --needed -- "${files[@]}" >/dev/null 2>&1
-}
-
-build_in_dir() {
-  # Build packages in current directory (non-root).
-  # -s install deps, -c clean after, -f force rebuild, --noconfirm, --needed for deps.
-  #
-  # We do not use -i here, because we want to install only the installed subset artifacts.
-  makepkg -scf --noconfirm --needed
-}
-
-# ----- main scan/update loop -----
 
 main() {
-  check_deps
-
-  ROOT="$(cd "$ROOT" && pwd)"
-  log_info "Root: $ROOT"
-  log_debug "Interactive: $INTERACTIVE | Yes-all: $YES_ALL | Dry-run: $DRY_RUN | Clean: $CLEAN | Include VCS: $INCLUDE_VCS"
-
-  local -a dirs=()
-
-  if [[ ${#SELECTED_DIRS[@]} -gt 0 ]]; then
-    local d=""
-    for d in "${SELECTED_DIRS[@]}"; do
-      [[ -d "$ROOT/$d" ]] && dirs+=("$ROOT/$d")
-    done
-  else
-    while IFS= read -r d; do
-      dirs+=("$d")
-    done < <(find "$ROOT" -maxdepth 2 -mindepth 2 -type f -name PKGBUILD -printf '%h\n' 2>/dev/null | sort)
-  fi
-
-  if [[ ${#dirs[@]} -eq 0 ]]; then
-    log_warn "No PKGBUILD directories found under: $ROOT"
-    return 0
-  fi
-
-  local checked=0
-  local updated=0
-  local skipped=0
-  local failed=0
-
-  local dir=""
-  for dir in "${dirs[@]}"; do
-    local pkgb="$dir/PKGBUILD"
-    [[ -f "$pkgb" ]] || continue
-
-    local dir_name="${dir##*/}"
-    ((checked++))
-
-    (
-      cd "$dir"
-
-      # Collect pkgnames, then filter to installed pkgnames
-      local -a all_pkgs=()
-      local p=""
-      while IFS= read -r p; do
-        [[ -n "$p" ]] && all_pkgs+=("$p")
-      done < <(pkgbuild_pkgnames || true)
-
-      if [[ ${#all_pkgs[@]} -eq 0 ]]; then
-        log_warn "[$dir_name] Could not read pkgname(s) (makepkg --printsrcinfo failed?)"
-        exit 0
-      fi
-
-      # Skip VCS by default (unless --include-vcs)
-      if [[ "$INCLUDE_VCS" != "true" ]]; then
-        local maybe_vcs="false"
-        for p in "${all_pkgs[@]}"; do
-          if is_vcs_name "$p"; then
-            maybe_vcs="true"
-            break
-          fi
-        done
-        if [[ "$maybe_vcs" == "true" ]]; then
-          log_ok "[$dir_name] Skip VCS package(s): ${all_pkgs[*]}"
-          exit 0
-        fi
-      fi
-
-      local -a installed_pkgs=()
-      for p in "${all_pkgs[@]}"; do
-        if is_installed "$p"; then
-          installed_pkgs+=("$p")
-        fi
-      done
-
-      if [[ ${#installed_pkgs[@]} -eq 0 ]]; then
-        log_ok "[$dir_name] No produced packages are installed; skipping"
-        exit 0
-      fi
-
-      # Read version meta from PKGBUILD
-      local meta=""
-      meta="$(pkgbuild_meta || true)"
-      if [[ -z "$meta" ]]; then
-        log_warn "[$dir_name] Could not read pkgver/pkgrel (skipping): ${installed_pkgs[*]}"
-        exit 0
-      fi
-
-      local epoch="" pkgver="" pkgrel=""
-      read -r epoch pkgver pkgrel <<<"$meta"
-
-      local local_ver=""
-      local_ver="$(local_version_string "$epoch" "$pkgver" "$pkgrel")"
-
-      # Determine if any installed pkg needs an update
-      local need_update="false"
-      local any_newer="false"
-      local any_older="false"
-
-      for p in "${installed_pkgs[@]}"; do
-        local inst_ver=""
-        inst_ver="$(installed_version "$p")"
-
-        if vercmp_eq "$local_ver" "$inst_ver"; then
-          log_ok "[$dir_name] $p up-to-date ($inst_ver)"
-          continue
-        fi
-
-        if vercmp_gt "$local_ver" "$inst_ver"; then
-          log_info "[$dir_name] $p needs update ($inst_ver -> $local_ver)"
-          need_update="true"
-          any_newer="true"
-        else
-          log_warn "[$dir_name] $p installed is newer than local ($inst_ver > $local_ver)"
-          any_older="true"
-        fi
-      done
-
-      # Only act if local is newer for at least one installed pkg
-      if [[ "$any_newer" != "true" ]]; then
-        exit 0
-      fi
-
-      # Ask once per directory (covers split packages)
-      if ! confirm_action "$dir_name: install update" "installed" "local $local_ver"; then
-        log_info "[$dir_name] Skipped by user"
-        exit 0
-      fi
-
-      # If artifacts already exist for the needed installed pkgs, install directly.
-      local -a want_files=()
-      while IFS= read -r p; do
-        [[ -n "$p" ]] && want_files+=("$p")
-      done < <(artifact_paths_for_installed_pkgs "$pkgver" "$pkgrel" <<<"$(printf "%s\n" "${installed_pkgs[@]}")")
-
-      if [[ ${#want_files[@]} -gt 0 ]] && all_files_exist "${want_files[@]}"; then
-        if [[ "$DRY_RUN" == "true" ]]; then
-          log_info "[$dir_name] DRY-RUN: would install existing artifacts: ${want_files[*]}"
-          exit 0
-        fi
-
-        if ! install_files "${want_files[@]}"; then
-          log_warn "[$dir_name] Install failed (existing artifacts)."
-          exit 1
-        fi
-
-        log_ok "[$dir_name] Installed existing artifacts."
-        exit 0
-      fi
-
-      # Otherwise build, then install the produced artifacts for the installed subset.
-      if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[$dir_name] DRY-RUN: would build (no matching artifacts found) then install"
-        exit 0
-      fi
-
-      if [[ "$CLEAN" == "true" ]]; then
-        rm -rf "$dir/src" "$dir/pkg" "$dir"/*.pkg.tar.* >/dev/null 2>&1 || true
-      fi
-
-      if ! build_in_dir >"$dir/.install-updates.build.log" 2>&1; then
-        log_warn "[$dir_name] Build failed (see $dir/.install-updates.build.log)"
-        exit 1
-      fi
-
-      # Recompute artifact list post-build and install
-      want_files=()
-      while IFS= read -r p; do
-        [[ -n "$p" ]] && want_files+=("$p")
-      done < <(artifact_paths_for_installed_pkgs "$pkgver" "$pkgrel" <<<"$(printf "%s\n" "${installed_pkgs[@]}")")
-
-      if [[ ${#want_files[@]} -eq 0 ]] || ! all_files_exist "${want_files[@]}"; then
-        log_warn "[$dir_name] Build succeeded but expected artifacts not found for installed packages"
-        exit 1
-      fi
-
-      if ! install_files "${want_files[@]}"; then
-        log_warn "[$dir_name] Install failed after build."
-        exit 1
-      fi
-
-      log_ok "[$dir_name] Built + installed update."
-      exit 0
-    )
-
-    case "$?" in
-      0) ((updated++)) ;;
-      *) ((failed++)); log_warn "Continuing after failure in: ${dir##*/}" ;;
-    esac
-  done
-
-  log_info "Checked: $checked | Updated/acted: $updated | Failed: $failed"
-  if [[ "$failed" -gt 0 ]]; then
-    exit 1
-  fi
+  parse_args "$@"
+  
+  case "$INSTALL_FROM" in
+    staging)
+      install_from_staging
+      ;;
+    repo)
+      install_from_repo
+      ;;
+    auto)
+      install_auto
+      ;;
+    *)
+      log_error "Invalid installation source: $INSTALL_FROM"
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"
