@@ -539,6 +539,45 @@ is_vcs_pkg() {
   return 1
 }
 
+update_pkgbuild_version() {
+  local pkgbuild_path="${1:-}"
+  local new_version="${2:-}"
+
+  local clean_version
+  clean_version="$(trim "$new_version")"
+  clean_version="${clean_version//-/_}"
+
+  if [[ ! -w "$(dirname "$pkgbuild_path")" ]]; then
+    log_warning "Not writable: $(dirname "$pkgbuild_path")"
+    return 1
+  fi
+
+  # Backup
+  if ! cp "$pkgbuild_path" "${pkgbuild_path}.backup" 2>/dev/null; then
+    log_warning "Failed to write backup: ${pkgbuild_path}.backup"
+    return 1
+  fi
+
+  # Update pkgver
+  if ! sed -i -E "s/^pkgver=.*/pkgver='${clean_version//&/\\&}'/" "$pkgbuild_path"; then
+    log_warning "Failed to update pkgver in $pkgbuild_path"
+    return 1
+  fi
+
+  # Reset pkgrel to 1
+  if ! sed -i -E "s/^pkgrel=.*/pkgrel=1/" "$pkgbuild_path"; then
+    log_warning "Failed to update pkgrel in $pkgbuild_path"
+    return 1
+  fi
+
+  return 0
+}
+
+update_checksums() {
+  local pkg_dir="${1:-}"
+  ( cd "$pkg_dir" && updpkgsums ) >/dev/null 2>&1
+}
+
 # ============================================================================
 # Version Comparison & Status
 # ============================================================================
@@ -547,20 +586,39 @@ compare_versions() {
   local current="${1:-}"
   local upstream="${2:-}"
   
+  log_debug "compare_versions: current='$current' upstream='$upstream'"
+  
   # Use vercmp if available for accurate comparison
   if command -v vercmp >/dev/null 2>&1; then
-    case "$(vercmp "$upstream" "$current")" in
-      -1) return 1 ;;  # upstream < current (local is newer)
-      0)  return 2 ;;  # upstream == current (up to date)
-      1)  return 0 ;;  # upstream > current (update available)
+    local vercmp_result
+    vercmp_result="$(vercmp "$upstream" "$current")"
+    log_debug "vercmp '$upstream' '$current' returned: $vercmp_result"
+    
+    case "$vercmp_result" in
+      -1) 
+        log_debug "  → upstream < current (local is newer)"
+        return 1
+        ;;
+      0)
+        log_debug "  → upstream == current (up to date)"
+        return 2
+        ;;
+      1)
+        log_debug "  → upstream > current (update available)"
+        return 0
+        ;;
     esac
   else
+    log_debug "vercmp not available, using string comparison"
     # Fallback to string comparison
     if [[ "$upstream" == "$current" ]]; then
+      log_debug "  → strings equal (up to date)"
       return 2  # Equal
     elif [[ "$upstream" > "$current" ]]; then
+      log_debug "  → upstream > current (update available)"
       return 0  # Update available
     else
+      log_debug "  → upstream < current (local newer)"
       return 1  # Local newer
     fi
   fi
@@ -602,11 +660,25 @@ status_for() {
   compare_versions "$current" "$upstream"
   local cmp_result=$?
   
+  log_debug "status_for: cmp_result=$cmp_result"
+  
   case $cmp_result in
-    0)  echo "UPDATE" ;;  # Update available
-    2)  echo "OK" ;;      # Up to date
-    1)  echo "NEWER" ;;   # Local is newer
-    *)  echo "UNKNOWN" ;; # Error
+    0)  
+      log_debug "  → returning UPDATE"
+      echo "UPDATE"
+      ;;
+    2)  
+      log_debug "  → returning OK"
+      echo "OK"
+      ;;
+    1)  
+      log_debug "  → returning NEWER"
+      echo "NEWER"
+      ;;
+    *)  
+      log_debug "  → returning UNKNOWN (unexpected result: $cmp_result)"
+      echo "UNKNOWN"
+      ;;
   esac
 }
 
@@ -627,6 +699,7 @@ print_table_header() {
 declare FEEDS_JSON="$DEFAULT_FEEDS_JSON"
 declare LIST_OUTDATED="false"
 declare OUTPUT_JSON="false"
+declare APPLY_UPDATES="false"
 declare DEBUG="false"
 declare -a SPECIFIC_PACKAGES=()
 
@@ -634,12 +707,14 @@ show_usage() {
   cat <<EOF
 Usage: $0 [OPTIONS] [packages...]
 
-Check which packages need updates (version detection only, no building).
+Check which packages need updates (version detection only by default).
+Use --apply to actually update PKGBUILDs.
 
 This script does NOT build packages. Use build-packages.sh for building.
 
 OPTIONS:
   --feeds <path>        Path to feeds.json (default: $DEFAULT_FEEDS_JSON)
+  --apply               Actually update PKGBUILDs (pkgver + checksums)
   --list-outdated       Only output package names needing updates
   --json                Output JSON for scripting
   --debug               Extra diagnostics
@@ -649,17 +724,24 @@ If packages are specified, only those packages are checked.
 Otherwise, all packages in feeds.json are checked.
 
 EXAMPLES:
-  # Check all packages
+  # Check all packages (dry-run)
   $0
+
+  # Actually update PKGBUILDs
+  $0 --apply
 
   # Check specific packages
   $0 ktailctl ollama
 
+  # Update specific packages
+  $0 --apply ktailctl ollama
+
   # Get list for piping to build-packages.sh
   $0 --list-outdated | xargs ./build-packages.sh
 
-  # JSON output for scripting
-  $0 --json
+  # Full workflow
+  $0 --apply
+  $0 --list-outdated | xargs ./build-packages.sh
 EOF
 }
 
@@ -670,6 +752,7 @@ parse_args() {
         FEEDS_JSON="$2"
         shift 2
         ;;
+      --apply) APPLY_UPDATES="true"; shift ;;
       --list-outdated) LIST_OUTDATED="true"; shift ;;
       --json) OUTPUT_JSON="true"; shift ;;
       --debug) DEBUG="true"; shift ;;
@@ -790,8 +873,29 @@ check_single_package() {
     
     case "$status" in
       UPDATE)
-        log_info "$pkg: ${current:-n/a} → $upstream_display (update available)"
-        return 0
+        # Apply updates if --apply flag is set
+        if [[ "$APPLY_UPDATES" == "true" ]]; then
+          log_info "$pkg: Updating ${current:-n/a} → $upstream_display"
+          
+          if update_pkgbuild_version "$pkgbuild" "$upstream"; then
+            log_info "$pkg: Updated PKGBUILD"
+            
+            # Update checksums
+            if update_checksums "$pkg_dir"; then
+              log_success "$pkg: Updated checksums"
+            else
+              log_warning "$pkg: Failed to update checksums (run updpkgsums manually)"
+            fi
+            
+            return 0
+          else
+            log_error "$pkg: Failed to update PKGBUILD"
+            return 1
+          fi
+        else
+          log_info "$pkg: ${current:-n/a} → $upstream_display (update available)"
+          return 0
+        fi
         ;;
       OK)
         log_success "$pkg: up-to-date ($current)"
@@ -844,20 +948,34 @@ check_all_packages() {
   
   local pkg=""
   local outdated_count=0
+  local updated_count=0
   
   for pkg in "${all_packages[@]}"; do
     if check_single_package "$pkg"; then
       ((outdated_count++))
+      if [[ "$APPLY_UPDATES" == "true" ]]; then
+        ((updated_count++))
+      fi
     fi
   done
   
   if [[ "$LIST_OUTDATED" != "true" && "$OUTPUT_JSON" != "true" ]]; then
     echo ""
-    if [[ $outdated_count -eq 0 ]]; then
-      log_success "All packages are up-to-date"
+    if [[ "$APPLY_UPDATES" == "true" ]]; then
+      if [[ $updated_count -eq 0 ]]; then
+        log_success "No packages needed updating"
+      else
+        log_success "Updated $updated_count package(s)"
+        log_info "Build with: ./build-packages.sh --list-outdated | xargs ./build-packages.sh"
+      fi
     else
-      log_info "$outdated_count package(s) need updates"
-      log_info "Build with: ./build-packages.sh --all"
+      if [[ $outdated_count -eq 0 ]]; then
+        log_success "All packages are up-to-date"
+      else
+        log_info "$outdated_count package(s) need updates"
+        log_info "Apply updates: $0 --apply"
+        log_info "Then build: ./build-packages.sh --all"
+      fi
     fi
   fi
   
@@ -877,6 +995,11 @@ main() {
   command -v curl >/dev/null 2>&1 || missing+=("curl")
   command -v python3 >/dev/null 2>&1 || missing+=("python")
   command -v xmllint >/dev/null 2>&1 || missing+=("libxml2")
+  
+  # Only check for updpkgsums if --apply is set
+  if [[ "$APPLY_UPDATES" == "true" ]]; then
+    command -v updpkgsums >/dev/null 2>&1 || missing+=("pacman-contrib")
+  fi
   
   if [[ ${#missing[@]} -gt 0 ]]; then
     log_error "Missing dependencies: ${missing[*]}"
